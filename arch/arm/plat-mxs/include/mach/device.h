@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2009-2010 Freescale Semiconductor, Inc. All Rights Reserved.
+ * Copyright (C) 2009-2011 Freescale Semiconductor, Inc. All Rights Reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -123,6 +123,7 @@ struct mxs_spi_platform_data {
 	int (*hw_pin_init)(void);
 	int (*hw_pin_release)(void);
 
+	int slave_mode;
 	char *clk;
 };
 
