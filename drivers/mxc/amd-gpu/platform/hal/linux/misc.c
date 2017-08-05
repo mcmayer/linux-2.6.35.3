@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2010-2011 Freescale Semiconductor, Inc. All Rights Reserved.
+ * Copyright (C) 2010 Freescale Semiconductor, Inc. All Rights Reserved.
  */
 
 /*
@@ -30,8 +30,6 @@ typedef struct _gsl_autogate_t {
     struct timer_list timer;	
     spinlock_t lock;
     int active;
-    /* pending indicate the timer has been fired but clock not yet disabled. */
-    int pending;
     int timeout;
     gsl_device_t *dev;
     struct work_struct dis_task;
@@ -49,7 +47,6 @@ static void clk_disable_task(struct work_struct *work)
 	if (autogate->dev->ftbl.device_idle)
 		autogate->dev->ftbl.device_idle(autogate->dev, GSL_TIMEOUT_DEFAULT);
 	kgsl_clock(autogate->dev->id, 0);
-	autogate->pending = 0;
 }
 
 static int _kgsl_device_active(gsl_device_t *dev, int all)
@@ -65,7 +62,7 @@ static int _kgsl_device_active(gsl_device_t *dev, int all)
 
 	spin_lock_irqsave(&autogate->lock, flags);
 	if (in_interrupt()) {
-		if (!autogate->active && !autogate->pending)
+		if (!autogate->active)
 			BUG();
 	} else {
 		to_active = !autogate->active;
@@ -88,7 +85,7 @@ static int _kgsl_device_active(gsl_device_t *dev, int all)
 }
 int kgsl_device_active(gsl_device_t *dev)
 {
-	return _kgsl_device_active(dev, 0);
+	return _kgsl_device_active(dev, 1);
 }
 
 static void kgsl_device_inactive(unsigned long data)
@@ -102,7 +99,6 @@ static void kgsl_device_inactive(unsigned long data)
 	WARN(!autogate->active, "GPU Device %d is already inactive\n", autogate->dev->id);
 	if (autogate->active) {
 		autogate->active = 0;
-		autogate->pending = 1;
 		schedule_work(&autogate->dis_task);
 	}
 	spin_unlock_irqrestore(&autogate->lock, flags);
@@ -132,7 +128,7 @@ int kgsl_device_autogate_init(gsl_device_t *dev)
 	gsl_autogate_t *autogate;
 
 //	printk(KERN_ERR "%s:%d id %d\n", __func__, __LINE__, dev->id);
-	autogate = kzalloc(sizeof(gsl_autogate_t), GFP_KERNEL);
+	autogate = kmalloc(sizeof(gsl_autogate_t), GFP_KERNEL);
 	if (!autogate) {
 		printk(KERN_ERR "%s: out of memory!\n", __func__);
 		return -ENOMEM;

@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2005 MontaVista Software
- * Copyright (C) 2011 Freescale Semiconductor, Inc.
+ * Copyright (C) 2011 Freescale Semiconductor
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the
@@ -40,7 +40,6 @@ static void fsl_usb_lowpower_mode(struct fsl_usb2_platform_data *pdata, bool ena
 		if (pdata->phy_lowpower_suspend)
 			pdata->phy_lowpower_suspend(pdata, false);
 	}
-
 	pdata->lowpower = enable;
 }
 

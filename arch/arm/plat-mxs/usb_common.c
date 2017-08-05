@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2009-2010 Freescale Semiconductor, Inc. All Rights Reserved.
+ * Copyright (C) 2009-2011 Freescale Semiconductor, Inc. All Rights Reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -46,8 +46,6 @@
 #include <mach/arc_otg.h>
 #include <mach/hardware.h>
 #include <linux/io.h>
-#include "regs-usbphy.h"
-
 #define MXC_NUMBER_USB_TRANSCEIVER 6
 struct fsl_xcvr_ops *g_xc_ops[MXC_NUMBER_USB_TRANSCEIVER] = { NULL };
 
@@ -105,8 +103,6 @@ EXPORT_SYMBOL(fsl_platform_set_usb_phy_dis);
 
 
 #if defined(CONFIG_USB_OTG)
-static struct otg_transceiver *xceiv;
-
 static struct resource *otg_resources;
 
 struct resource *otg_get_resources(void)
@@ -123,6 +119,37 @@ int otg_set_resources(struct resource *resources)
 }
 EXPORT_SYMBOL(otg_set_resources);
 #endif
+
+/*!
+ * Register remote wakeup by this usb controller
+ *
+ * @param pdev: platform_device for this usb controller
+ *
+ * @return 0 or negative error code in case not supportted.
+ */
+static int usb_register_remote_wakeup(struct platform_device *pdev)
+{
+	struct fsl_usb2_platform_data *pdata = pdev->dev.platform_data;
+	struct resource *res;
+	int irq;
+
+	pr_debug("%s: pdev=0x%p \n", __func__, pdev);
+	if (!(pdata->wake_up_enable))
+		return -ECANCELED;
+
+	res = platform_get_resource(pdev, IORESOURCE_IRQ, 0);
+	if (!res) {
+		dev_err(&pdev->dev,
+		"Found HC with no IRQ. Check %s setup!\n",
+		dev_name(&pdev->dev));
+		return -ENODEV;
+	}
+	irq = res->start;
+	pdev->dev.power.can_wakeup = 1;
+	enable_irq_wake(irq);
+
+	return 0;
+}
 
 static struct fsl_xcvr_ops *fsl_usb_get_xcvr(char *name)
 {
@@ -251,7 +278,6 @@ int usbotg_init(struct platform_device *pdev)
 {
 	struct fsl_usb2_platform_data *pdata = pdev->dev.platform_data;
 	struct fsl_xcvr_ops *xops;
-	u32 tmp;
 
 	pr_debug("%s: pdev=0x%p  pdata=0x%p\n", __func__, pdev, pdata);
 
@@ -270,10 +296,6 @@ int usbotg_init(struct platform_device *pdev)
 			xops->init(xops);
 		usb_phy_enable(pdata);
 	}
-	/* Enable internal Phy clock */
-	tmp = __raw_readl(pdata->regs + UOG_PORTSC1);
-	tmp &= ~PORTSC_PHCD;
-	__raw_writel(tmp, pdata->regs + UOG_PORTSC1);
 
 	if ((pdata->operating_mode == FSL_USB2_DR_HOST) ||
 			(pdata->operating_mode == FSL_USB2_DR_OTG)) {
@@ -281,6 +303,9 @@ int usbotg_init(struct platform_device *pdev)
 		__raw_writel(BM_USBPHY_CTRL_ENUTMILEVEL2 | BM_USBPHY_CTRL_ENUTMILEVEL3
 				, IO_ADDRESS(pdata->phy_regs) + HW_USBPHY_CTRL_SET);
 	}
+
+	if (usb_register_remote_wakeup(pdev))
+		pr_debug("%s port is not a wakeup source.\n", pdata->name);
 
 	otg_used++;
 	pr_debug("%s: success\n", __func__);
@@ -290,21 +315,10 @@ EXPORT_SYMBOL(usbotg_init);
 
 void usbotg_uninit(struct fsl_usb2_platform_data *pdata)
 {
-	int tmp;
-	struct clk *usb_clk;
 	pr_debug("%s\n", __func__);
 
 	if (pdata->xcvr_ops && pdata->xcvr_ops->uninit)
 		pdata->xcvr_ops->uninit(pdata->xcvr_ops);
-
-	/* Disable internal Phy clock */
-	tmp = __raw_readl(pdata->regs + UOG_PORTSC1);
-	tmp |= PORTSC_PHCD;
-	__raw_writel(tmp, pdata->regs + UOG_PORTSC1);
-
-	usb_clk = clk_get(NULL, "usb_clk0");
-	clk_disable(usb_clk);
-	clk_put(usb_clk);
 
 	pdata->regs = NULL;
 	otg_used--;
@@ -337,6 +351,9 @@ int fsl_usb_host_init(struct platform_device *pdev)
 	tmp |= (BM_USBPHY_CTRL_ENUTMILEVEL2 | BM_USBPHY_CTRL_ENUTMILEVEL3);
 	__raw_writel(tmp, phy_reg + HW_USBPHY_CTRL);
 
+	if (usb_register_remote_wakeup(pdev))
+		pr_debug("%s port is not a wakeup source.\n", pdata->name);
+
 	pr_debug("%s: %s success\n", __func__, pdata->name);
 	return 0;
 }
@@ -344,19 +361,24 @@ EXPORT_SYMBOL(fsl_usb_host_init);
 
 void fsl_usb_host_uninit(struct fsl_usb2_platform_data *pdata)
 {
-	struct clk *usb_clk;
 	pr_debug("%s\n", __func__);
 
 	if (pdata->xcvr_ops && pdata->xcvr_ops->uninit)
 		pdata->xcvr_ops->uninit(pdata->xcvr_ops);
 
-	usb_clk = clk_get(NULL, "usb_clk1");
-	clk_disable(usb_clk);
-	clk_put(usb_clk);
-
 	pdata->regs = NULL;
 }
 EXPORT_SYMBOL(fsl_usb_host_uninit);
+
+/*
+ * This function is used to debounce the reading value for id/vbus at
+ * the register of otgsc
+ */
+void usb_debounce_id_vbus(void)
+{
+	mdelay(3);
+}
+EXPORT_SYMBOL(usb_debounce_id_vbus);
 
 int usb_host_wakeup_irq(struct device *wkup_dev)
 {
@@ -366,12 +388,27 @@ EXPORT_SYMBOL(usb_host_wakeup_irq);
 
 void usb_host_set_wakeup(struct device *wkup_dev, bool para)
 {
+	struct fsl_usb2_platform_data *pdata = wkup_dev->platform_data;
+	if (pdata->wake_up_enable)
+		pdata->wake_up_enable(pdata, para);
 }
 EXPORT_SYMBOL(usb_host_set_wakeup);
 
 #ifdef CONFIG_ARCH_MX28
 #define USBPHY_PHYS_ADDR USBPHY0_PHYS_ADDR
 #endif
+
+int usb_event_is_otg_wakeup(void)
+{
+	u32 wakeup_irq_bits;
+	wakeup_irq_bits = BM_USBPHY_CTRL_RESUME_IRQ | BM_USBPHY_CTRL_WAKEUP_IRQ;
+
+	if (__raw_readl(IO_ADDRESS(USBPHY_PHYS_ADDR) + HW_USBPHY_STATUS) && wakeup_irq_bits) {
+		return true;
+	}
+	return false;
+}
+EXPORT_SYMBOL(usb_event_is_otg_wakeup);
 
 int fsl_is_usb_plugged(void)
 {

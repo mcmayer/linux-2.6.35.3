@@ -41,7 +41,6 @@
 #include <linux/fb.h>
 #include <linux/init.h>
 #include <linux/platform_device.h>
-#include <linux/regulator/consumer.h>
 #include <linux/i2c.h>
 #include <linux/mxcfb.h>
 #include <linux/fsl_devices.h>
@@ -52,9 +51,7 @@
 
 #define IPU_DISP_PORT 0
 #define SII_EDID_LEN	256
-#define MXC_ENABLE	1
-#define MXC_DISABLE	2
-static int g_enable_hdmi;
+static bool g_enable_hdmi;
 
 struct sii902x_data {
 	struct platform_device *pdev;
@@ -64,7 +61,6 @@ struct sii902x_data {
 	struct mxc_edid_cfg edid_cfg;
 	u8 cable_plugin;
 	u8 edid[SII_EDID_LEN];
-	bool waiting_for_fb;
 } sii902x;
 
 static void sii902x_poweron(void);
@@ -278,9 +274,6 @@ static irqreturn_t sii902x_detect_handler(int irq, void *data)
 {
 	if (sii902x.fbi)
 		schedule_delayed_work(&(sii902x.det_work), msecs_to_jiffies(20));
-	else
-		sii902x.waiting_for_fb = true;
-
 	return IRQ_HANDLED;
 }
 
@@ -289,14 +282,20 @@ static int sii902x_fb_event(struct notifier_block *nb, unsigned long val, void *
 	struct fb_event *event = v;
 	struct fb_info *fbi = event->info;
 
+	/* assume sii902x on DI0 only */
+	if ((IPU_DISP_PORT)) {
+		if (strcmp(event->info->fix.id, "DISP3 BG - DI1"))
+			return 0;
+	} else {
+		if (strcmp(event->info->fix.id, "DISP3 BG"))
+			return 0;
+	}
+
 	switch (val) {
 	case FB_EVENT_FB_REGISTERED:
-		if (sii902x.fbi == NULL) {
-			sii902x.fbi = fbi;
-			if (sii902x.waiting_for_fb)
-				det_worker(NULL);
-		}
-		fb_show_logo(fbi, 0);
+		if (sii902x.fbi != NULL)
+			break;
+		sii902x.fbi = fbi;
 		break;
 	case FB_EVENT_MODE_CHANGE:
 		sii902x_setup(fbi);
@@ -322,23 +321,10 @@ static int __devinit sii902x_probe(struct i2c_client *client,
 	struct mxc_lcd_platform_data *plat = client->dev.platform_data;
 	struct fb_info edid_fbi;
 
-	if (plat->boot_enable &&
-		!g_enable_hdmi)
-		g_enable_hdmi = MXC_ENABLE;
-	if (!g_enable_hdmi)
-		g_enable_hdmi = MXC_DISABLE;
-
-	if (g_enable_hdmi == MXC_DISABLE) {
-		printk(KERN_WARNING "By setting, SII driver will not be enabled\n");
-		return 0;
-	}
+	if (g_enable_hdmi == false)
+		return -EPERM;
 
 	sii902x.client = client;
-
-	/* Claim HDMI pins */
-	if (plat->get_pins)
-		if (!plat->get_pins())
-			return -EACCES;
 
 	if (plat->reset) {
 		sii902x_reset = plat->reset;
@@ -373,18 +359,11 @@ static int __devinit sii902x_probe(struct i2c_client *client,
 	}
 
 	/* try to read edid */
-	ret = sii902x_read_edid(&edid_fbi);
-	if (ret < 0)
+	if (sii902x_read_edid(&edid_fbi) < 0)
 		dev_warn(&sii902x.client->dev, "Can not read edid\n");
-
 #if defined(CONFIG_MXC_IPU_V3) && defined(CONFIG_FB_MXC_SYNC_PANEL)
-	if (ret >= 0)
+	else
 		mxcfb_register_mode(IPU_DISP_PORT, edid_fbi.monspecs.modedb,
-				edid_fbi.monspecs.modedb_len, MXC_DISP_DDC_DEV);
-#endif
-#if defined(CONFIG_FB_MXC_ELCDIF_FB)
-	if (ret >= 0)
-		mxcfb_elcdif_register_mode(edid_fbi.monspecs.modedb,
 				edid_fbi.monspecs.modedb_len, MXC_DISP_DDC_DEV);
 #endif
 
@@ -422,15 +401,8 @@ static int __devinit sii902x_probe(struct i2c_client *client,
 
 static int __devexit sii902x_remove(struct i2c_client *client)
 {
-	struct mxc_lcd_platform_data *plat = sii902x.client->dev.platform_data;
-
 	fb_unregister_client(&nb);
 	sii902x_poweroff();
-
-	/* Release HDMI pins */
-	if (plat->put_pins)
-		plat->put_pins();
-
 	return 0;
 }
 
@@ -448,12 +420,6 @@ static int sii902x_resume(struct i2c_client *client)
 
 static void sii902x_poweron(void)
 {
-	struct mxc_lcd_platform_data *plat = sii902x.client->dev.platform_data;
-
-	/* Enable pins to HDMI */
-	if (plat->enable_pins)
-		plat->enable_pins();
-
 	/* Turn on DVI or HDMI */
 	if (sii902x.edid_cfg.hdmi_cap)
 		i2c_smbus_write_byte_data(sii902x.client, 0x1A, 0x01);
@@ -464,17 +430,11 @@ static void sii902x_poweron(void)
 
 static void sii902x_poweroff(void)
 {
-	struct mxc_lcd_platform_data *plat = sii902x.client->dev.platform_data;
-
 	/* disable tmds before changing resolution */
 	if (sii902x.edid_cfg.hdmi_cap)
 		i2c_smbus_write_byte_data(sii902x.client, 0x1A, 0x11);
 	else
 		i2c_smbus_write_byte_data(sii902x.client, 0x1A, 0x10);
-
-	/* Disable pins to HDMI */
-	if (plat->disable_pins)
-		plat->disable_pins();
 
 	return;
 }
@@ -523,10 +483,7 @@ static void __exit sii902x_exit(void)
 
 static int __init enable_hdmi_setup(char *options)
 {
-	if (!strcmp(options, "=off"))
-		g_enable_hdmi = MXC_DISABLE;
-	else
-		g_enable_hdmi = MXC_ENABLE;
+	g_enable_hdmi = true;
 
 	return 1;
 }

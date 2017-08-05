@@ -104,10 +104,8 @@ static int enabled;		/* enable power on or not */
 DEFINE_SPINLOCK(tve_lock);
 
 static struct fb_info *tve_fbi;
-#define MXC_ENABLE	1
-#define MXC_DISABLE	2
-static int g_enable_tve;
-static int g_enable_vga;
+static bool g_enable_tve;
+static bool g_enable_vga;
 
 struct tve_data {
 	struct platform_device *pdev;
@@ -748,8 +746,6 @@ static int tve_update_detect_status(void)
 	u32 cd_cont_reg;
 	u32 timeout = 40;
 	unsigned long lock_flags;
-	char event_string[16];
-	char *envp[] = { event_string, NULL };
 
 	spin_lock_irqsave(&tve_lock, lock_flags);
 
@@ -831,18 +827,8 @@ static int tve_update_detect_status(void)
 	__raw_writel(int_ctl | CD_SM_INT | CD_LM_INT,
 			tve.base + tve_regs->tve_int_cont_reg);
 
-	if (old_detect != tve.detect) {
+	if (old_detect != tve.detect)
 		sysfs_notify(&tve.pdev->dev.kobj, NULL, "headphone");
-		if (tve.detect == 1)
-			sprintf(event_string, "EVENT=CVBS0");
-		else if (tve.detect == 3)
-			sprintf(event_string, "EVENT=YPBPR");
-		else if (tve.detect == 4)
-			sprintf(event_string, "EVENT=SVIDEO");
-		else
-			sprintf(event_string, "EVENT=NONE");
-		kobject_uevent_env(&tve.pdev->dev.kobj, KOBJ_CHANGE, envp);
-	}
 
 	dev_dbg(&tve.pdev->dev, "detect = %d mode = %d\n",
 			tve.detect, tve.output_mode);
@@ -1125,27 +1111,8 @@ static int tve_probe(struct platform_device *pdev)
 	struct tve_platform_data *plat_data = pdev->dev.platform_data;
 	u32 conf_reg;
 
-	/*
-	 * tve/vga can be enabled by platform data when there is
-	 * no setting from cmdline setup
-	 */
-	if ((plat_data->boot_enable & MXC_TVE_TVOUT)
-		&& !g_enable_tve)
-		g_enable_tve = MXC_ENABLE;
-	if (!g_enable_tve)
-		g_enable_tve = MXC_DISABLE;
-
-	if ((plat_data->boot_enable & MXC_TVE_VGA) &&
-		!g_enable_vga)
-		g_enable_vga = MXC_ENABLE;
-	if (!g_enable_vga)
-		g_enable_vga = MXC_DISABLE;
-
-	if (g_enable_tve == MXC_DISABLE &&
-		g_enable_vga == MXC_DISABLE) {
-		printk(KERN_WARNING "By setting, TVE driver will not be enabled\n");
-		return 0;
-	}
+	if (g_enable_tve == false && g_enable_vga == false)
+		return -EPERM;
 
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	if (res == NULL)
@@ -1217,16 +1184,16 @@ static int tve_probe(struct platform_device *pdev)
 
 	/* TVE is on disp port 1 */
 	if (tve.revision == 1) {
-		if (g_enable_tve == MXC_ENABLE)
+		if (g_enable_tve)
 			mxcfb_register_mode(IPU_DISP_PORT, video_modes,
 					3, MXC_DISP_SPEC_DEV);
 	} else {
-		if (g_enable_tve == MXC_ENABLE)
+		if (g_enable_tve)
 			mxcfb_register_mode(IPU_DISP_PORT, video_modes,
 					ARRAY_SIZE(video_modes),
 					MXC_DISP_SPEC_DEV);
 
-		if (cpu_is_mx53() && (g_enable_vga == MXC_ENABLE))
+		if (cpu_is_mx53() && g_enable_vga)
 			mxcfb_register_mode(IPU_DISP_PORT, video_modes_vga,
 					ARRAY_SIZE(video_modes_vga),
 					MXC_DISP_SPEC_DEV);
@@ -1290,10 +1257,7 @@ static struct platform_driver tve_driver = {
 
 static int __init enable_tve_setup(char *options)
 {
-	if (!strcmp(options, "=off"))
-		g_enable_tve = MXC_DISABLE;
-	else
-		g_enable_tve = MXC_ENABLE;
+	g_enable_tve = true;
 
 	return 1;
 }
@@ -1301,10 +1265,7 @@ __setup("tve", enable_tve_setup);
 
 static int __init enable_vga_setup(char *options)
 {
-	if (!strcmp(options, "=off"))
-		g_enable_vga = MXC_DISABLE;
-	else
-		g_enable_vga = MXC_ENABLE;
+	g_enable_vga = true;
 
 	return 1;
 }

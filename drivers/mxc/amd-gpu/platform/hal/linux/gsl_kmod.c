@@ -750,13 +750,13 @@ static struct class *gsl_kmod_class;
 
 static irqreturn_t z160_irq_handler(int irq, void *dev_id)
 {
-    kgsl_intr_isr(&gsl_driver.device[GSL_DEVICE_G12-1]);
+    kgsl_intr_isr();
     return IRQ_HANDLED;
 }
 
 static irqreturn_t z430_irq_handler(int irq, void *dev_id)
 {
-    kgsl_intr_isr(&gsl_driver.device[GSL_DEVICE_YAMATO-1]);
+    kgsl_intr_isr();
     return IRQ_HANDLED;
 }
 

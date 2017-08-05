@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2009-2010 Freescale Semiconductor, Inc. All Rights Reserved.
+ * Copyright (C) 2009-2011 Freescale Semiconductor, Inc. All Rights Reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -485,6 +485,26 @@ static struct platform_device mxs_persistent = {
 };
 #endif
 
+#ifdef CONFIG_MXS_PERFMON
+static struct platform_device mxs_perfmon = {
+	.name			= "mxs-perfmon",
+	.id			= 0,
+	.dev = {
+		.release = mxs_nop_release,
+		},
+};
+#endif
+
+#ifdef CONFIG_FSL_OTP
+static struct platform_device otp_device = {
+	.name			= "ocotp",
+	.id			= 0,
+	.dev = {
+		.release = mxs_nop_release,
+		},
+};
+#endif
+
 static inline void mxs_init_busfreq(void)
 {
 	(void)platform_device_register(&busfreq_device);
@@ -563,6 +583,22 @@ static struct mxs_dev_lookup dev_lookup[] = {
 	.name = "mxs-persistent",
 	.size = 1,
 	.pdev = &mxs_persistent,
+	},
+#endif
+
+#if defined(CONFIG_MXS_PERFMON)
+	{
+	.name = "mxs-perfmon",
+	.size = 1,
+	.pdev = &mxs_perfmon,
+	},
+#endif
+
+#if defined(CONFIG_FSL_OTP)
+	{
+	.name = "ocotp",
+	.size = 1,
+	.pdev = &otp_device,
 	},
 #endif
 

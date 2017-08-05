@@ -1,21 +1,15 @@
 /*
- * Copyright 2008-2011 Freescale Semiconductor, Inc. All Rights Reserved.
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
+ * Copyright 2008-2010 Freescale Semiconductor, Inc. All Rights Reserved.
  */
 
+/*
+ * The code contained herein is licensed under the GNU General Public
+ * License. You may obtain a copy of the GNU General Public License
+ * Version 2 or later at the following locations:
+ *
+ * http://www.opensource.org/licenses/gpl-license.html
+ * http://www.gnu.org/copyleft/gpl.html
+ */
 #ifndef __ASM_ARCH_MXC_PMIC_EXTERNAL_H__
 #define __ASM_ARCH_MXC_PMIC_EXTERNAL_H__
 
@@ -41,7 +35,6 @@
 
 #include <linux/ioctl.h>
 #include <linux/pmic_status.h>
-#include <linux/spi/spi.h>
 
 /*!
  * This is the enumeration of versions of PMIC
@@ -50,8 +43,7 @@ typedef enum {
 	PMIC_MC13783 = 1,	/*!< MC13783 */
 	PMIC_SC55112 = 2,	/*!< SC55112 */
 	PMIC_MC13892 = 3,
-	PMIC_MC34704 = 4,
-	PMIC_MC34708 = 5
+	PMIC_MC34704 = 4
 } pmic_id_t;
 
 /*!
@@ -133,10 +125,7 @@ typedef struct {
 #define PMIC_ARBITRATION	"NULL"
 
 
-#if defined(CONFIG_MXC_PMIC_MC13892_MODULE) ||	\
-	defined(CONFIG_MXC_PMIC_MC13892) ||	\
-	defined(CONFIG_MXC_PMIC_MC34708_MODULE) || \
-	defined(CONFIG_MXC_PMIC_MC34708)
+#if defined(CONFIG_MXC_PMIC_MC13892_MODULE) || defined(CONFIG_MXC_PMIC_MC13892)
 enum {
 	REG_INT_STATUS0 = 0,
 	REG_INT_MASK0,
@@ -296,76 +285,6 @@ void gpio_pmic_active(void);
 void pmic_event_list_init(void);
 void mc13892_power_off(void);
 
-enum {
-	REG_MC34708_INT_STATUS0 = 0,
-	REG_MC34708_INT_MASK0,
-	REG_MC34708_INT_SENSE0,
-	REG_MC34708_INT_STATUS1,
-	REG_MC34708_INT_MASK1,
-	REG_MC34708_INT_SENSE1,
-	REG_MC34708_PU_MODE_S,
-	REG_MC34708_IDENTIFICATION,
-	REG_MC34708_REGU_FAULT_S,
-	REG_MC34708_ACC0,
-	REG_MC34708_ACC1,		/*10 */
-	REG_MC34708_UNUSED1,
-	REG_MC34708_UNUSED2,
-	REG_MC34708_POWER_CTL0,
-	REG_MC34708_POWER_CTL1,
-	REG_MC34708_POWER_CTL2,
-	REG_MC34708_MEM_A,
-	REG_MC34708_MEM_B,
-	REG_MC34708_MEM_C,
-	REG_MC34708_MEM_D,
-	REG_MC34708_RTC_TIME,		/*20 */
-	REG_MC34708_RTC_ALARM,
-	REG_MC34708_RTC_DAY,
-	REG_MC34708_RTC_DAY_ALARM,
-	REG_MC34708_SW_1_A_B,
-	REG_MC34708_SW_2_3,
-	REG_MC34708_SW_4_A_B,
-	REG_MC34708_SW_5,
-	REG_MC34708_SW_1_2_OP,
-	REG_MC34708_SW_3_4_5_OP,
-	REG_MC34708_SETTING_0,		/*30 */
-	REG_MC34708_SWBST,
-	REG_MC34708_MODE_0,
-	REG_MC34708_GPIOLV0,
-	REG_MC34708_GPIOLV1,
-	REG_MC34708_GPIOLV2,
-	REG_MC34708_GPIOLV3,
-	REG_MC34708_USB_TIMING,
-	REG_MC34708_USB_BUTTON,
-	REG_MC34708_USB_CONTROL,
-	REG_MC34708_USB_DEVICE_TYPE, /*40 */
-	REG_MC34708_UNUSED3,
-	REG_MC34708_UNUSED4,
-	REG_MC34708_ADC0,
-	REG_MC34708_ADC1,
-	REG_MC34708_ADC2,
-	REG_MC34708_ADC3,
-	REG_MC34708_ADC4,
-	REG_MC34708_ADC5,
-	REG_MC34708_ADC6,
-	REG_MC34708_ADC7,		/*50 */
-	REG_MC34708_BATTERY_PRO,
-	REG_MC34708_CHARGER_DEBOUNCE,
-	REG_MC34708_CHARGER_SOURCE,
-	REG_MC34708_CHARGER_LED_CON,
-	REG_MC34708_PWM_CON,
-	REG_MC34708_UNUSED5,
-	REG_MC34708_UNUSED6,
-	REG_MC34708_UNUSED7,
-	REG_MC34708_UNUSED8,
-	REG_MC34708_UNUSED9,		/*60 */
-	REG_MC34708_UNUSED10,
-	REG_MC34708_UNUSED11,
-	REG_MC34708_UNUSED12,
-};
-
-extern struct i2c_client *mc34708_client;
-void mc34708_power_off(void);
-
 #elif defined(CONFIG_MXC_PMIC_MC34704_MODULE) || defined(CONFIG_MXC_PMIC_MC34704)
 
 typedef enum {
@@ -503,11 +422,6 @@ PMIC_STATUS pmic_get_sensors(t_sensor_bits *sensor_bits);
 
 void pmic_event_callback(type_event event);
 void pmic_event_list_init(void);
-
-unsigned int pmic_get_active_events(unsigned int *active_events);
-int pmic_event_mask(type_event event);
-int pmic_event_unmask(type_event event);
-int pmic_spi_setup(struct spi_device *spi);
 
 #endif				/*CONFIG_MXC_PMIC*/
 #endif				/* __KERNEL__ */

@@ -45,11 +45,23 @@
 #include <linux/mxcfb.h>
 #include <linux/mxcfb_epdc_kernel.h>
 #include <linux/gpio.h>
+#ifdef USE_PMIC
 #include <linux/regulator/driver.h>
+#endif
 #include <linux/fsl_devices.h>
+// Frank.Lin 2011.05.09
+#include <mach/hardware.h>
+#include <mach/gpio.h>
+#include <mach/iomux-mx50.h>
+
+#include <linux/time.h>
 #include <linux/bitops.h>
 
 #include "epdc_regs.h"
+#include "lk_tps65185.h"
+
+#define GDEBUG 0
+#include <linux/gallen_dbg.h>
 
 /*
  * Enable this define to have a default panel
@@ -59,7 +71,8 @@
 
 #define NUM_SCREENS_MIN	2
 #define EPDC_NUM_LUTS 16
-#define EPDC_MAX_NUM_UPDATES 20
+//#define EPDC_MAX_NUM_UPDATES 20
+#define EPDC_MAX_NUM_UPDATES giEPDC_MAX_NUM_UPDATES
 #define INVALID_LUT -1
 
 #define DEFAULT_TEMP_INDEX	0
@@ -75,7 +88,12 @@
 #define MERGE_FAIL	1
 #define MERGE_BLOCK	2
 
+// Frank.Lin 2011.05.09
+#define GPIO_PWRALL     (0*32 + 27) /* GPIO_1_27 */
+#define EPDC_VCOM	(3*32 + 21)	/*GPIO_4_21 */
+
 static unsigned long default_bpp = 16;
+static int giEPDC_MAX_NUM_UPDATES=2;
 
 struct update_marker_data {
 	struct list_head full_list;
@@ -134,8 +152,10 @@ struct mxc_epdc_fb_data {
 	struct completion powerdown_compl;
 	struct clk *epdc_clk_axi;
 	struct clk *epdc_clk_pix;
+#ifdef USE_PMIC
 	struct regulator *display_regulator;
 	struct regulator *vcom_regulator;
+#endif
 	bool fw_default_load;
 
 	/* FB elements related to EPDC updates */
@@ -168,6 +188,10 @@ struct mxc_epdc_fb_data {
 	struct delayed_work epdc_done_work;
 	struct workqueue_struct *epdc_submit_workqueue;
 	struct work_struct epdc_submit_work;
+//#ifdef FW_IN_RAM //[
+
+	struct work_struct epdc_firmware_work;
+//#endif//]FW_IN_RAM
 	bool waiting_for_wb;
 	bool waiting_for_lut;
 	bool waiting_for_lut15;
@@ -177,8 +201,10 @@ struct mxc_epdc_fb_data {
 	int eof_sync_period;
 	struct mutex power_mutex;
 	bool powering_down;
+	bool updates_active;
 	int pwrdown_delay;
 	unsigned long tce_prevent;
+	int merge_on_waveform_mismatch;
 
 	/* FB elements related to PxP DMA */
 	struct completion pxp_tx_cmpl;
@@ -221,6 +247,12 @@ struct mxcfb_waveform_data_file {
 	u32 *data;	/* Temperature Range Table + Waveform Data */
 };
 
+#include "ntx_hwconfig.h"
+extern volatile NTX_HWCONFIG *gptHWCFG;
+
+extern volatile int giRootDevNum;
+extern volatile int giRootPartNum;
+
 void __iomem *epdc_base;
 
 struct mxc_epdc_fb_data *g_fb_data;
@@ -239,8 +271,10 @@ static int pxp_complete_update(struct mxc_epdc_fb_data *fb_data, u32 *hist_stat)
 static void draw_mode0(struct mxc_epdc_fb_data *fb_data);
 static bool is_free_list_full(struct mxc_epdc_fb_data *fb_data);
 
+static void mxc_epdc_fb_fw_handler(const struct firmware *fw,void *context);
 
-#ifdef DEBUG
+//#ifdef DEBUG
+#if 1
 static void dump_pxp_config(struct mxc_epdc_fb_data *fb_data,
 			    struct pxp_config_data *pxp_conf)
 {
@@ -300,6 +334,7 @@ static void dump_pxp_config(struct mxc_epdc_fb_data *fb_data,
 
 static void dump_epdc_reg(void)
 {
+	#define KERN_DEBUG	
 	printk(KERN_DEBUG "\n\n");
 	printk(KERN_DEBUG "EPDC_CTRL 0x%x\n", __raw_readl(EPDC_CTRL));
 	printk(KERN_DEBUG "EPDC_WVADDR 0x%x\n", __raw_readl(EPDC_WVADDR));
@@ -844,6 +879,7 @@ void epdc_init_settings(struct mxc_epdc_fb_data *fb_data)
 static void epdc_powerup(struct mxc_epdc_fb_data *fb_data)
 {
 	int ret = 0;
+	int iChk;
 	mutex_lock(&fb_data->power_mutex);
 
 	/*
@@ -860,16 +896,51 @@ static void epdc_powerup(struct mxc_epdc_fb_data *fb_data)
 
 	dev_dbg(fb_data->dev, "EPDC Powerup\n");
 
+    fb_data->updates_active = true;
+    
+
+
+	if(6==gptHWCFG->m_val.bDisplayCtrl) {
+#if 1
+		// imx508 + tps16585 .
+		unsigned long dwTPS65185_mode = TPS65185_MODE_ACTIVE;
+
+		iChk = tps65185_chg_mode(&dwTPS65185_mode,1);
+		if(iChk<0) {
+			printk(KERN_ERR "%s(%d):[warning] change to power active fail,errno=%d !\n",
+				__FILE__,__LINE__,iChk);
+		}
+		/*	
+		iChk = tps65185_wait_panel_poweron();
+		if(iChk<0) {
+			printk(KERN_ERR "%s(%d):[warning] wait power on fail,errno=%d !\n",
+				__FILE__,__LINE__,iChk);
+		}
+		*/
+
+		//gpio_direction_output(EPDC_VCOM, 1);
+		//msleep(10);
+		
+#endif
+	}
+	else 
+	{
+		gpio_direction_output(GPIO_PWRALL, 1);msleep(50);
+		gpio_direction_output(EPDC_VCOM, 1);msleep(15);
+	}
+
 	/* Enable pins used by EPDC */
 	if (fb_data->pdata->enable_pins)
 		fb_data->pdata->enable_pins();
 
+	
 	/* Enable clocks to EPDC */
 	clk_enable(fb_data->epdc_clk_axi);
 	clk_enable(fb_data->epdc_clk_pix);
-
 	__raw_writel(EPDC_CTRL_CLKGATE, EPDC_CTRL_CLEAR);
 
+
+#ifdef USE_PMIC
 	/* Enable power to the EPD panel */
 	ret = regulator_enable(fb_data->display_regulator);
 	if (IS_ERR((void *)ret)) {
@@ -885,7 +956,9 @@ static void epdc_powerup(struct mxc_epdc_fb_data *fb_data)
 		mutex_unlock(&fb_data->power_mutex);
 		return;
 	}
-
+#else
+#endif
+	
 	fb_data->power_state = POWER_STATE_ON;
 
 	mutex_unlock(&fb_data->power_mutex);
@@ -893,6 +966,9 @@ static void epdc_powerup(struct mxc_epdc_fb_data *fb_data)
 
 static void epdc_powerdown(struct mxc_epdc_fb_data *fb_data)
 {
+	int iChk;
+	
+	GALLEN_DBGLOCAL_BEGIN();
 	mutex_lock(&fb_data->power_mutex);
 
 	/* If powering_down has been cleared, a powerup
@@ -901,14 +977,18 @@ static void epdc_powerdown(struct mxc_epdc_fb_data *fb_data)
 	if (!fb_data->powering_down
 		|| (fb_data->power_state == POWER_STATE_OFF)) {
 		mutex_unlock(&fb_data->power_mutex);
+		GALLEN_DBGLOCAL_ESC();
 		return;
 	}
 
 	dev_dbg(fb_data->dev, "EPDC Powerdown\n");
 
+#ifdef USE_PMIC
 	/* Disable power to the EPD panel */
 	regulator_disable(fb_data->vcom_regulator);
 	regulator_disable(fb_data->display_regulator);
+#else
+#endif
 
 	/* Disable clocks to EPDC */
 	__raw_writel(EPDC_CTRL_CLKGATE, EPDC_CTRL_SET);
@@ -917,45 +997,142 @@ static void epdc_powerdown(struct mxc_epdc_fb_data *fb_data)
 
 	/* Disable pins used by EPDC (to prevent leakage current) */
 	if (fb_data->pdata->disable_pins)
+	{
+		GALLEN_DBGLOCAL_RUNLOG(0);
 		fb_data->pdata->disable_pins();
+	}
+
+#if 1
+	if(6==gptHWCFG->m_val.bDisplayCtrl) 
+	{
+		// imx508 + tps16585 .
+		//msleep(10);
+		//gpio_direction_output(EPDC_VCOM, 0);
+		
+		//if(!(0==giRootDevNum&&2==giRootPartNum)) 
+		{
+			// imx508 + tps16585 .
+			//unsigned long dwTPS65185_mode = TPS65185_MODE_SLEEP;
+			unsigned long dwTPS65185_mode = TPS65185_MODE_STANDBY;
+			iChk = tps65185_chg_mode(&dwTPS65185_mode,1);
+			if(iChk<0) {
+				printk(KERN_ERR "%s(%d):[warning] change to power sleep fail ,errno=%d !\n",
+					__FILE__,__LINE__,iChk);
+			}	
+			/*	
+			iChk = tps65185_wait_panel_poweroff();
+			if(iChk<0) {
+				printk(KERN_ERR "%s(%d):[warning] wait power off fail ,errno=%d !\n",
+					__FILE__,__LINE__,iChk);
+			}	
+			*/
+		}
+		//else {
+			//printk(KERN_ERR "root=/dev/mmcblk0p2 skip PMIC power down !\n");
+		//}
+
+	}
+	else 
+	{
+		msleep(5);
+		gpio_direction_output(EPDC_VCOM, 0);
+	
+		msleep(5);// gallen add 2011/06/17 .
+		gpio_direction_output(GPIO_PWRALL, 0);
+	}
+#endif
+
+
+	
 
 	fb_data->power_state = POWER_STATE_OFF;
 	fb_data->powering_down = false;
 
 	if (fb_data->wait_for_powerdown) {
+		GALLEN_DBGLOCAL_RUNLOG(1);
 		fb_data->wait_for_powerdown = false;
 		complete(&fb_data->powerdown_compl);
 	}
 
 	mutex_unlock(&fb_data->power_mutex);
+	GALLEN_DBGLOCAL_END();
 }
+
+
+#include "mxc_epdc_fake_s1d13522.c"
+
 
 static void epdc_init_sequence(struct mxc_epdc_fb_data *fb_data)
 {
 	/* Initialize EPDC, passing pointer to EPDC registers */
+
+	// gallen add : gpio request 
+	mxc_iomux_v3_setup_pad(MX50_PAD_EIM_CRE__GPIO_1_27);
+	if(0!=gpio_request(GPIO_PWRALL, "epd_power_on")) {
+		//printk(KERN_ERR "%s(%d) : epd_power_on request fail !\n",__FUNCTION__,__LINE__);
+	}
+
 	epdc_init_settings(fb_data);
 	__raw_writel(fb_data->waveform_buffer_phys, EPDC_WVADDR);
 	__raw_writel(fb_data->working_buffer_phys, EPDC_WB_ADDR);
-	epdc_powerup(fb_data);
-	draw_mode0(fb_data);
-	epdc_powerdown(fb_data);
+	//epdc_powerup(fb_data);
+	//draw_mode0(fb_data);
+	//epdc_powerdown(fb_data);
+	
+	
 }
+
 
 static int mxc_epdc_fb_mmap(struct fb_info *info, struct vm_area_struct *vma)
 {
 	u32 len;
 	unsigned long offset = vma->vm_pgoff << PAGE_SHIFT;
+	
+	u32 mem_start,mem_len;
 
-	if (offset < info->fix.smem_len) {
+	GALLEN_DBGLOCAL_BEGIN();
+	
+	fake_s1d13522_progress_stop();
+	
+	if(0==gptHWCFG->m_val.bUIStyle) {
+		GALLEN_DBGLOCAL_RUNLOG(0);
+		//mem_start = (u32)gpbLOGO_paddr;
+		//mem_len = (u32)((2048*1024*1024)-1024);
+		mem_start = info->fix.smem_start+info->fix.smem_len;
+		mem_len = info->fix.smem_len;
+
+	}
+	else {
+		GALLEN_DBGLOCAL_RUNLOG(1);
+		mem_start = info->fix.smem_start;
+		mem_len = info->fix.smem_len;
+	}
+	
+	GALLEN_DBGLOCAL_PRINTMSG("mem_start=0x%x,mem_len=0x%x\n",\
+		mem_start,mem_len);
+	GALLEN_DBGLOCAL_PRINTMSG("vma.vm_start=0x%x,vma.vm_end=0x%x\n",\
+		vma->vm_start,vma->vm_end);
+	GALLEN_DBGLOCAL_PRINTMSG("offset=0x%x\n",\
+		offset);
+
+	if (offset < mem_len) {
 		/* mapping framebuffer memory */
-		len = info->fix.smem_len - offset;
-		vma->vm_pgoff = (info->fix.smem_start + offset) >> PAGE_SHIFT;
+		GALLEN_DBGLOCAL_RUNLOG(2);
+		len = mem_len - offset;
+		vma->vm_pgoff = (mem_start + offset) >> PAGE_SHIFT;
 	} else
+	{
+		GALLEN_DBGLOCAL_ESC();
 		return -EINVAL;
+	}
 
 	len = PAGE_ALIGN(len);
 	if (vma->vm_end - vma->vm_start > len)
+	{
+		GALLEN_DBGLOCAL_ESC();
 		return -EINVAL;
+		//WARNING_MSG("[warning] %s:request mmap size too large !!\n",__FUNCTION__);
+	}
 
 	/* make buffers bufferable */
 	vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
@@ -964,38 +1141,45 @@ static int mxc_epdc_fb_mmap(struct fb_info *info, struct vm_area_struct *vma)
 
 	if (remap_pfn_range(vma, vma->vm_start, vma->vm_pgoff,
 			    vma->vm_end - vma->vm_start, vma->vm_page_prot)) {
+		GALLEN_DBGLOCAL_ESC();
 		dev_dbg(info->device, "mmap remap_pfn_range failed\n");
 		return -ENOBUFS;
 	}
 
+	GALLEN_DBGLOCAL_END();
 	return 0;
 }
 
 static int mxc_epdc_fb_setcolreg(u_int regno, u_int red, u_int green,
 				 u_int blue, u_int transp, struct fb_info *info)
 {
+	GALLEN_DBGLOCAL_MUTEBEGIN();
 	if (regno >= 256)	/* no. of hw registers */
+	{
+		GALLEN_DBGLOCAL_ESC();
 		return 1;
+	}
 	/*
 	 * Program hardware... do anything you want with transp
 	 */
 
 	/* grayscale works only partially under directcolor */
 	if (info->var.grayscale) {
+		GALLEN_DBGLOCAL_RUNLOG(0);
 		/* grayscale = 0.30*R + 0.59*G + 0.11*B */
 		red = green = blue = (red * 77 + green * 151 + blue * 28) >> 8;
 	}
 
 #define CNVT_TOHW(val, width) ((((val)<<(width))+0x7FFF-(val))>>16)
 	switch (info->fix.visual) {
-	case FB_VISUAL_TRUECOLOR:
-	case FB_VISUAL_PSEUDOCOLOR:
+	case FB_VISUAL_TRUECOLOR:GALLEN_DBGLOCAL_RUNLOG(1);
+	case FB_VISUAL_PSEUDOCOLOR:GALLEN_DBGLOCAL_RUNLOG(2);
 		red = CNVT_TOHW(red, info->var.red.length);
 		green = CNVT_TOHW(green, info->var.green.length);
 		blue = CNVT_TOHW(blue, info->var.blue.length);
 		transp = CNVT_TOHW(transp, info->var.transp.length);
 		break;
-	case FB_VISUAL_DIRECTCOLOR:
+	case FB_VISUAL_DIRECTCOLOR:GALLEN_DBGLOCAL_RUNLOG(3);
 		red = CNVT_TOHW(red, 8);	/* expect 8 bit DAC */
 		green = CNVT_TOHW(green, 8);
 		blue = CNVT_TOHW(blue, 8);
@@ -1006,9 +1190,12 @@ static int mxc_epdc_fb_setcolreg(u_int regno, u_int red, u_int green,
 #undef CNVT_TOHW
 	/* Truecolor has hardware independent palette */
 	if (info->fix.visual == FB_VISUAL_TRUECOLOR) {
+		GALLEN_DBGLOCAL_RUNLOG(4);
 
-		if (regno >= 16)
+		if (regno >= 16) {
+			GALLEN_DBGLOCAL_ESC();
 			return 1;
+		}
 
 		((u32 *) (info->pseudo_palette))[regno] =
 		    (red << info->var.red.offset) |
@@ -1016,6 +1203,7 @@ static int mxc_epdc_fb_setcolreg(u_int regno, u_int red, u_int green,
 		    (blue << info->var.blue.offset) |
 		    (transp << info->var.transp.offset);
 	}
+	GALLEN_DBGLOCAL_MUTEEND();
 	return 0;
 }
 
@@ -1133,6 +1321,8 @@ static int mxc_epdc_fb_set_par(struct fb_info *info)
 	unsigned long flags;
 	__u32 xoffset_old, yoffset_old;
 
+	GALLEN_DBGLOCAL_BEGIN();
+
 	/*
 	 * Can't change the FB parameters until current updates have completed.
 	 * This function returns when all active updates are done.
@@ -1175,20 +1365,23 @@ static int mxc_epdc_fb_set_par(struct fb_info *info)
 	 * configure S0 channel parameters
 	 * Parameters should match FB format/width/height
 	 */
-	if (screeninfo->grayscale)
+	if (screeninfo->grayscale) {
+		GALLEN_DBGLOCAL_RUNLOG(0);
 		pxp_conf->s0_param.pixel_fmt = PXP_PIX_FMT_GREY;
+	}
 	else {
+		GALLEN_DBGLOCAL_RUNLOG(1);
 		switch (screeninfo->bits_per_pixel) {
-		case 16:
+		case 16:GALLEN_DBGLOCAL_RUNLOG(2);
 			pxp_conf->s0_param.pixel_fmt = PXP_PIX_FMT_RGB565;
 			break;
-		case 24:
+		case 24:GALLEN_DBGLOCAL_RUNLOG(3);
 			pxp_conf->s0_param.pixel_fmt = PXP_PIX_FMT_RGB24;
 			break;
-		case 32:
+		case 32:GALLEN_DBGLOCAL_RUNLOG(4);
 			pxp_conf->s0_param.pixel_fmt = PXP_PIX_FMT_RGB32;
 			break;
-		default:
+		default:GALLEN_DBGLOCAL_RUNLOG(5);
 			pxp_conf->s0_param.pixel_fmt = PXP_PIX_FMT_RGB565;
 			break;
 		}
@@ -1217,6 +1410,8 @@ static int mxc_epdc_fb_set_par(struct fb_info *info)
 		struct fb_videomode mode;
 		bool found_match = false;
 		u32 xres_temp;
+		
+		GALLEN_DBGLOCAL_RUNLOG(6);
 
 		fb_var_to_videomode(&mode, screeninfo);
 
@@ -1224,6 +1419,7 @@ static int mxc_epdc_fb_set_par(struct fb_info *info)
 		   we need to use unrotated dimensions */
 		if ((screeninfo->rotate == FB_ROTATE_CW) ||
 			(screeninfo->rotate == FB_ROTATE_CCW)) {
+			GALLEN_DBGLOCAL_RUNLOG(7);
 			xres_temp = mode.xres;
 			mode.xres = mode.yres;
 			mode.yres = xres_temp;
@@ -1231,16 +1427,22 @@ static int mxc_epdc_fb_set_par(struct fb_info *info)
 
 		/* Match videomode against epdc modes */
 		for (i = 0; i < fb_data->pdata->num_modes; i++) {
-			if (!fb_mode_is_equal(epdc_modes[i].vmode, &mode))
+			GALLEN_DBGLOCAL_RUNLOG(8);
+			if (!fb_mode_is_equal(epdc_modes[i].vmode, &mode)) {
+				GALLEN_DBGLOCAL_RUNLOG(9);
 				continue;
+			}
 			fb_data->cur_mode = &epdc_modes[i];
 			found_match = true;
 			break;
 		}
 
 		if (!found_match) {
+			GALLEN_DBGLOCAL_RUNLOG(10);
 			dev_err(fb_data->dev,
 				"Failed to match requested video mode\n");
+				
+			GALLEN_DBGLOCAL_ESC();
 			return EINVAL;
 		}
 
@@ -1258,6 +1460,7 @@ static int mxc_epdc_fb_set_par(struct fb_info *info)
 		if (ret) {
 			dev_err(fb_data->dev,
 				"Failed to load panel waveform data\n");
+			GALLEN_DBGLOCAL_ESC();
 			return ret;
 		}
 	}
@@ -1276,6 +1479,7 @@ static int mxc_epdc_fb_set_par(struct fb_info *info)
 
 	mxc_epdc_fb_set_fix(info);
 
+	GALLEN_DBGLOCAL_END();
 	return 0;
 }
 
@@ -1283,24 +1487,43 @@ static int mxc_epdc_fb_check_var(struct fb_var_screeninfo *var,
 				 struct fb_info *info)
 {
 	struct mxc_epdc_fb_data *fb_data = (struct mxc_epdc_fb_data *)info;
+	
+	GALLEN_DBGLOCAL_BEGIN();
 
-	if (!var->xres)
+	if (!var->xres) 
+	{
+		GALLEN_DBGLOCAL_RUNLOG(10);
 		var->xres = 1;
+	}
+		
 	if (!var->yres)
+	{
+		GALLEN_DBGLOCAL_RUNLOG(11);
 		var->yres = 1;
+	}
 
 	if (var->xres_virtual < var->xoffset + var->xres)
+	{
+		GALLEN_DBGLOCAL_RUNLOG(12);
 		var->xres_virtual = var->xoffset + var->xres;
+	}
 	if (var->yres_virtual < var->yoffset + var->yres)
+	{
+		GALLEN_DBGLOCAL_RUNLOG(13);
 		var->yres_virtual = var->yoffset + var->yres;
+	}
 
 	if ((var->bits_per_pixel != 32) && (var->bits_per_pixel != 24) &&
 	    (var->bits_per_pixel != 16) && (var->bits_per_pixel != 8))
+	{
+		GALLEN_DBGLOCAL_RUNLOG(0);
 		var->bits_per_pixel = default_bpp;
+	}
 
 	switch (var->bits_per_pixel) {
-	case 8:
+	case 8:GALLEN_DBGLOCAL_RUNLOG(0);
 		if (var->grayscale != 0) {
+			GALLEN_DBGLOCAL_RUNLOG(1);
 			/*
 			 * For 8-bit grayscale, R, G, and B offset are equal.
 			 *
@@ -1320,7 +1543,7 @@ static int mxc_epdc_fb_check_var(struct fb_var_screeninfo *var,
 			var->transp.length = 0;
 			var->transp.offset = 0;
 			var->transp.msb_right = 0;
-		} else {
+		} else {GALLEN_DBGLOCAL_RUNLOG(2);
 			var->red.length = 3;
 			var->red.offset = 5;
 			var->red.msb_right = 0;
@@ -1338,7 +1561,7 @@ static int mxc_epdc_fb_check_var(struct fb_var_screeninfo *var,
 			var->transp.msb_right = 0;
 		}
 		break;
-	case 16:
+	case 16:GALLEN_DBGLOCAL_RUNLOG(3);
 		var->red.length = 5;
 		var->red.offset = 11;
 		var->red.msb_right = 0;
@@ -1355,7 +1578,7 @@ static int mxc_epdc_fb_check_var(struct fb_var_screeninfo *var,
 		var->transp.offset = 0;
 		var->transp.msb_right = 0;
 		break;
-	case 24:
+	case 24:GALLEN_DBGLOCAL_RUNLOG(4);
 		var->red.length = 8;
 		var->red.offset = 16;
 		var->red.msb_right = 0;
@@ -1372,7 +1595,7 @@ static int mxc_epdc_fb_check_var(struct fb_var_screeninfo *var,
 		var->transp.offset = 0;
 		var->transp.msb_right = 0;
 		break;
-	case 32:
+	case 32:GALLEN_DBGLOCAL_RUNLOG(5);
 		var->red.length = 8;
 		var->red.offset = 16;
 		var->red.msb_right = 0;
@@ -1392,17 +1615,17 @@ static int mxc_epdc_fb_check_var(struct fb_var_screeninfo *var,
 	}
 
 	switch (var->rotate) {
-	case FB_ROTATE_UR:
-	case FB_ROTATE_UD:
+	case FB_ROTATE_UR:GALLEN_DBGLOCAL_RUNLOG(6);
+	case FB_ROTATE_UD:GALLEN_DBGLOCAL_RUNLOG(7);
 		var->xres = fb_data->native_width;
 		var->yres = fb_data->native_height;
 		break;
-	case FB_ROTATE_CW:
-	case FB_ROTATE_CCW:
+	case FB_ROTATE_CW:GALLEN_DBGLOCAL_RUNLOG(8);
+	case FB_ROTATE_CCW:GALLEN_DBGLOCAL_RUNLOG(9);
 		var->xres = fb_data->native_height;
 		var->yres = fb_data->native_width;
 		break;
-	default:
+	default:GALLEN_DBGLOCAL_RUNLOG(10);
 		/* Invalid rotation value */
 		var->rotate = 0;
 		dev_dbg(fb_data->dev, "Invalid rotation request\n");
@@ -1415,6 +1638,7 @@ static int mxc_epdc_fb_check_var(struct fb_var_screeninfo *var,
 	var->height = -1;
 	var->width = -1;
 
+	GALLEN_DBGLOCAL_END();
 	return 0;
 }
 
@@ -1424,7 +1648,7 @@ void mxc_epdc_fb_set_waveform_modes(struct mxcfb_waveform_modes *modes,
 	struct mxc_epdc_fb_data *fb_data = info ?
 		(struct mxc_epdc_fb_data *)info:g_fb_data;
 
-	memcpy(&fb_data->wv_modes, modes, sizeof(modes));
+	memcpy(&fb_data->wv_modes, modes, sizeof(struct mxcfb_waveform_modes));
 }
 EXPORT_SYMBOL(mxc_epdc_fb_set_waveform_modes);
 
@@ -1449,9 +1673,14 @@ static int mxc_epdc_fb_get_temp_index(struct mxc_epdc_fb_data *fb_data, int temp
 	}
 
 	if (index < 0) {
-		dev_err(fb_data->dev,
-			"No TRT index match...using default temp index\n");
-		return DEFAULT_TEMP_INDEX;
+		if(temp < fb_data->temp_range_bounds[0]){
+			dev_err(fb_data->dev, "temperature < minimum range\n");
+			return 0;
+		}
+		if(temp >= fb_data->temp_range_bounds[fb_data->trt_entries-1]){
+			dev_err(fb_data->dev, "temperature >= maximum range\n");
+			return (fb_data->trt_entries-1);
+		}
 	}
 
 	dev_dbg(fb_data->dev, "Using temperature index %d\n", index);
@@ -1492,6 +1721,16 @@ int mxc_epdc_fb_set_auto_update(u32 auto_mode, struct fb_info *info)
 	return 0;
 }
 EXPORT_SYMBOL(mxc_epdc_fb_set_auto_update);
+
+int mxc_epdc_fb_set_merge_on_waveform_mismatch(int merge, struct fb_info *info)
+{
+	struct mxc_epdc_fb_data *fb_data = info ?
+		(struct mxc_epdc_fb_data *)info:g_fb_data;
+
+	fb_data->merge_on_waveform_mismatch = (merge) ? 1 : 0;
+
+	return 0;
+}
 
 int mxc_epdc_fb_set_upd_scheme(u32 upd_scheme, struct fb_info *info)
 {
@@ -1601,6 +1840,7 @@ static int epdc_process_update(struct update_data_list *upd_data_list,
 
 	int ret;
 
+	GALLEN_DBGLOCAL_BEGIN();
 	/*
 	 * Gotta do a whole bunch of buffer ptr manipulation to
 	 * work around HW restrictions for PxP & EPDC
@@ -1611,10 +1851,12 @@ static int epdc_process_update(struct update_data_list *upd_data_list,
 	 * buffer for source of update?
 	 */
 	if (upd_desc_list->upd_data.flags & EPDC_FLAG_USE_ALT_BUFFER) {
+		GALLEN_DBGLOCAL_RUNLOG(0);
 		src_width = upd_desc_list->upd_data.alt_buffer_data.width;
 		src_height = upd_desc_list->upd_data.alt_buffer_data.height;
 		src_upd_region = &upd_desc_list->upd_data.alt_buffer_data.alt_update_region;
 	} else {
+		GALLEN_DBGLOCAL_RUNLOG(1);
 		src_width = fb_data->epdc_fb_var.xres_virtual;
 		src_height = fb_data->epdc_fb_var.yres;
 		src_upd_region = &upd_desc_list->upd_data.update_region;
@@ -1660,12 +1902,17 @@ static int epdc_process_update(struct update_data_list *upd_data_list,
 	if ((((fb_data->epdc_fb_var.rotate == FB_ROTATE_UR) ||
 		fb_data->epdc_fb_var.rotate == FB_ROTATE_UD)) &&
 		(ALIGN(src_upd_region->width, 8) <
-			ALIGN(src_upd_region->width + pix_per_line_added, 8)))
+			ALIGN(src_upd_region->width + pix_per_line_added, 8))) 
+	{
+		GALLEN_DBGLOCAL_RUNLOG(2);
+		
 		line_overflow = true;
+	}
 
 	if (((width_unaligned || height_unaligned || input_unaligned) &&
 		(upd_desc_list->upd_data.waveform_mode == WAVEFORM_MODE_AUTO))
 		|| line_overflow) {
+		GALLEN_DBGLOCAL_RUNLOG(3);
 
 		dev_dbg(fb_data->dev, "Copying update before processing.\n");
 
@@ -1696,6 +1943,7 @@ static int epdc_process_update(struct update_data_list *upd_data_list,
 	input_unaligned = ((offset_from_4 * bytes_per_pixel % 4) != 0) ?
 				true : false;
 	if (input_unaligned) {
+		GALLEN_DBGLOCAL_RUNLOG(4);
 		/* Leave a gap between PxP input addr and update region pixels */
 		pxp_input_offs =
 			(src_upd_region->top * src_width + src_upd_region->left)
@@ -1704,6 +1952,7 @@ static int epdc_process_update(struct update_data_list *upd_data_list,
 		pxp_upd_region.top = 0;
 		pxp_upd_region.left = offset_from_4 / bytes_per_pixel;
 	} else {
+		GALLEN_DBGLOCAL_RUNLOG(5);
 		pxp_input_offs =
 			(src_upd_region->top * src_width + src_upd_region->left)
 			* bytes_per_pixel;
@@ -1718,23 +1967,23 @@ static int epdc_process_update(struct update_data_list *upd_data_list,
 	pxp_upd_region.height = ALIGN(src_upd_region->height, 8);
 
 	switch (fb_data->epdc_fb_var.rotate) {
-	case FB_ROTATE_UR:
-	default:
+	case FB_ROTATE_UR:GALLEN_DBGLOCAL_RUNLOG(5);
+	default:GALLEN_DBGLOCAL_RUNLOG(6);
 		post_rotation_xcoord = pxp_upd_region.left;
 		post_rotation_ycoord = pxp_upd_region.top;
 		width_pxp_blocks = pxp_upd_region.width;
 		break;
-	case FB_ROTATE_CW:
+	case FB_ROTATE_CW:GALLEN_DBGLOCAL_RUNLOG(7);
 		width_pxp_blocks = pxp_upd_region.height;
 		post_rotation_xcoord = width_pxp_blocks - src_upd_region->height;
 		post_rotation_ycoord = pxp_upd_region.left;
 		break;
-	case FB_ROTATE_UD:
+	case FB_ROTATE_UD:GALLEN_DBGLOCAL_RUNLOG(8);
 		width_pxp_blocks = pxp_upd_region.width;
 		post_rotation_xcoord = width_pxp_blocks - src_upd_region->width - pxp_upd_region.left;
 		post_rotation_ycoord = pxp_upd_region.height - src_upd_region->height - pxp_upd_region.top;
 		break;
-	case FB_ROTATE_CCW:
+	case FB_ROTATE_CCW:GALLEN_DBGLOCAL_RUNLOG(9);
 		width_pxp_blocks = pxp_upd_region.height;
 		post_rotation_xcoord = pxp_upd_region.top;
 		post_rotation_ycoord = pxp_upd_region.width - src_upd_region->width - pxp_upd_region.left;
@@ -1757,14 +2006,21 @@ static int epdc_process_update(struct update_data_list *upd_data_list,
 
 	/* Source address either comes from alternate buffer
 	   provided in update data, or from the framebuffer. */
-	if (use_temp_buf)
+	if (use_temp_buf) 
+	{
+		GALLEN_DBGLOCAL_RUNLOG(10);
 		sg_dma_address(&fb_data->sg[0]) =
 			upd_data_list->phys_addr_copybuf;
+	}
 	else if (upd_desc_list->upd_data.flags & EPDC_FLAG_USE_ALT_BUFFER)
+	{
+		GALLEN_DBGLOCAL_RUNLOG(11);
 		sg_dma_address(&fb_data->sg[0]) =
 			upd_desc_list->upd_data.alt_buffer_data.phys_addr
 				+ pxp_input_offs;
+	}
 	else {
+		GALLEN_DBGLOCAL_RUNLOG(12);
 		sg_dma_address(&fb_data->sg[0]) =
 			fb_data->info.fix.smem_start + fb_data->fb_offset
 			+ pxp_input_offs;
@@ -1786,17 +2042,26 @@ static int epdc_process_update(struct update_data_list *upd_data_list,
 	 */
 	fb_data->pxp_conf.proc_data.lut_transform = 0;
 	if (upd_desc_list->upd_data.flags & EPDC_FLAG_ENABLE_INVERSION)
+	{
+		GALLEN_DBGLOCAL_RUNLOG(13);
 		fb_data->pxp_conf.proc_data.lut_transform |= PXP_LUT_INVERT;
+	}
 	if (upd_desc_list->upd_data.flags & EPDC_FLAG_FORCE_MONOCHROME)
+	{
+		GALLEN_DBGLOCAL_RUNLOG(14);
 		fb_data->pxp_conf.proc_data.lut_transform |=
 			PXP_LUT_BLACK_WHITE;
+	}
 
 	/*
 	 * Toggle inversion processing if 8-bit
 	 * inverted is the current pixel format.
 	 */
 	if (fb_data->epdc_fb_var.grayscale == GRAYSCALE_8BIT_INVERTED)
+	{
+		GALLEN_DBGLOCAL_RUNLOG(15);
 		fb_data->pxp_conf.proc_data.lut_transform ^= PXP_LUT_INVERT;
+	}
 
 	/* This is a blocking call, so upon return PxP tx should be done */
 	ret = pxp_process_update(fb_data, src_width, src_height,
@@ -1804,6 +2069,7 @@ static int epdc_process_update(struct update_data_list *upd_data_list,
 	if (ret) {
 		dev_err(fb_data->dev, "Unable to submit PxP update task.\n");
 		mutex_unlock(&fb_data->pxp_mutex);
+		GALLEN_DBGLOCAL_ESC();
 		return ret;
 	}
 
@@ -1811,6 +2077,7 @@ static int epdc_process_update(struct update_data_list *upd_data_list,
 	if ((fb_data->power_state == POWER_STATE_OFF)
 		|| fb_data->powering_down) {
 		epdc_powerup(fb_data);
+		GALLEN_DBGLOCAL_RUNLOG(16);
 	}
 
 	/* This is a blocking call, so upon return PxP tx should be done */
@@ -1818,6 +2085,7 @@ static int epdc_process_update(struct update_data_list *upd_data_list,
 	if (ret) {
 		dev_err(fb_data->dev, "Unable to complete PxP update task.\n");
 		mutex_unlock(&fb_data->pxp_mutex);
+		GALLEN_DBGLOCAL_ESC();
 		return ret;
 	}
 
@@ -1825,37 +2093,56 @@ static int epdc_process_update(struct update_data_list *upd_data_list,
 
 	/* Update waveform mode from PxP histogram results */
 	if (upd_desc_list->upd_data.waveform_mode == WAVEFORM_MODE_AUTO) {
+		GALLEN_DBGLOCAL_RUNLOG(17);
 		if (hist_stat & 0x1)
+		{
+			GALLEN_DBGLOCAL_RUNLOG(18);
 			upd_desc_list->upd_data.waveform_mode =
 				fb_data->wv_modes.mode_du;
+		}
 		else if (hist_stat & 0x2)
+		{
+			GALLEN_DBGLOCAL_RUNLOG(19);
 			upd_desc_list->upd_data.waveform_mode =
 				fb_data->wv_modes.mode_gc4;
+		}
 		else if (hist_stat & 0x4)
+		{
+			GALLEN_DBGLOCAL_RUNLOG(20);
 			upd_desc_list->upd_data.waveform_mode =
 				fb_data->wv_modes.mode_gc8;
+		}
 		else if (hist_stat & 0x8)
+		{
+			GALLEN_DBGLOCAL_RUNLOG(21);
 			upd_desc_list->upd_data.waveform_mode =
 				fb_data->wv_modes.mode_gc16;
+		}
 		else
+		{
+			GALLEN_DBGLOCAL_RUNLOG(22);
 			upd_desc_list->upd_data.waveform_mode =
 				fb_data->wv_modes.mode_gc32;
+		}
 
 		dev_dbg(fb_data->dev, "hist_stat = 0x%x, new waveform = 0x%x\n",
 			hist_stat, upd_desc_list->upd_data.waveform_mode);
 	}
 
+	GALLEN_DBGLOCAL_END();
 	return 0;
 
 }
 
 static int epdc_submit_merge(struct update_desc_list *upd_desc_list,
-				struct update_desc_list *update_to_merge)
+				struct update_desc_list *update_to_merge,
+				int merge_on_waveform_mismatch)
 {
 	struct mxcfb_update_data *a, *b;
 	struct mxcfb_rect *arect, *brect;
 	struct mxcfb_rect combine;
 	bool use_flags = false;
+	int waveform_mismatch;
 
 	a = &upd_desc_list->upd_data;
 	b = &update_to_merge->upd_data;
@@ -1880,13 +2167,22 @@ static int epdc_submit_merge(struct update_desc_list *upd_desc_list,
 		use_flags = true;
 	}
 
-	if (a->update_mode != b->update_mode)
-		a->update_mode = UPDATE_MODE_FULL;
+	if (merge_on_waveform_mismatch) {
+		if (a->update_mode != b->update_mode)
+			a->update_mode = UPDATE_MODE_FULL;
 
-	if (a->waveform_mode != b->waveform_mode)
-		a->waveform_mode = WAVEFORM_MODE_AUTO;
+		if (a->waveform_mode != b->waveform_mode)
+			a->waveform_mode = WAVEFORM_MODE_AUTO;
 
-	if (arect->left > (brect->left + brect->width) ||
+		waveform_mismatch = 0;
+	} else {
+		waveform_mismatch = (a->waveform_mode != b->waveform_mode &&
+		                     a->waveform_mode != WAVEFORM_MODE_AUTO) ||
+		                    a->update_mode != b->update_mode;
+	}
+
+	if (waveform_mismatch ||
+		arect->left > (brect->left + brect->width) ||
 		brect->left > (arect->left + arect->width) ||
 		arect->top > (brect->top + brect->height) ||
 		brect->top > (arect->top + arect->height))
@@ -1921,6 +2217,23 @@ static int epdc_submit_merge(struct update_desc_list *upd_desc_list,
 	return MERGE_OK;
 }
 
+#ifdef FW_IN_RAM //[
+
+static void epdc_firmware_func(struct work_struct *work)
+{
+	struct mxc_epdc_fb_data *fb_data =
+		container_of(work, struct mxc_epdc_fb_data, epdc_firmware_work);
+	struct firmware fw;
+
+	fw.size = gdwWF_size;
+	fw.data = (u8*)gpbWF_vaddr;
+
+	printk("[%s]:fw p=%p,size=%u\n",__FUNCTION__,fw.data,fw.size);
+	mxc_epdc_fb_fw_handler(&fw,fb_data);
+}
+	
+#endif //]FW_IN_RAM
+
 static void epdc_submit_work_func(struct work_struct *work)
 {
 	int temp_index;
@@ -1932,9 +2245,12 @@ static void epdc_submit_work_func(struct work_struct *work)
 		container_of(work, struct mxc_epdc_fb_data, epdc_submit_work);
 	struct update_data_list *upd_data_list = NULL;
 	struct mxcfb_rect adj_update_region;
+	
+	
 	bool end_merge = false;
 	int ret;
 
+	GALLEN_DBGLOCAL_BEGIN();
 	/* Protect access to buffer queues and to update HW */
 	spin_lock_irqsave(&fb_data->queue_lock, flags);
 
@@ -1945,30 +2261,41 @@ static void epdc_submit_work_func(struct work_struct *work)
 	 */
 	list_for_each_entry_safe(next_update, temp_update,
 				&fb_data->upd_buf_collision_list, list) {
+		GALLEN_DBGLOCAL_RUNLOG(0);
 
-		if (next_update->collision_mask != 0)
+		if (next_update->collision_mask != 0) {
+			GALLEN_DBGLOCAL_RUNLOG(1);
 			continue;
+		}
 
 		dev_dbg(fb_data->dev, "A collision update is ready to go!\n");
 
-		/* Force waveform mode to auto for resubmitted collisions */
-		next_update->update_desc->upd_data.waveform_mode =
-			WAVEFORM_MODE_AUTO;
+		if (fb_data->merge_on_waveform_mismatch) {
+			/* Force waveform mode to auto for resubmitted collisions */
+			next_update->update_desc->upd_data.waveform_mode =
+				WAVEFORM_MODE_AUTO;
+		}
 
 		/*
 		 * We have a collision cleared, so select it for resubmission.
 		 * If an update is already selected, attempt to merge.
 		 */
 		if (!upd_data_list) {
+			GALLEN_DBGLOCAL_RUNLOG(2);
 			upd_data_list = next_update;
 			list_del_init(&next_update->list);
-			if (fb_data->upd_scheme == UPDATE_SCHEME_QUEUE)
+			if (fb_data->upd_scheme == UPDATE_SCHEME_QUEUE) {
+				GALLEN_DBGLOCAL_RUNLOG(3);
 				/* If not merging, we have our update */
 				break;
+			}
 		} else {
+			GALLEN_DBGLOCAL_RUNLOG(4);
 			switch (epdc_submit_merge(upd_data_list->update_desc,
-						next_update->update_desc)) {
-			case MERGE_OK:
+						next_update->update_desc,
+						fb_data->merge_on_waveform_mismatch)) {
+							
+			case MERGE_OK:GALLEN_DBGLOCAL_RUNLOG(5);
 				dev_dbg(fb_data->dev,
 					"Update merged [collision]\n");
 				list_del_init(&next_update->update_desc->list);
@@ -1979,11 +2306,11 @@ static void epdc_submit_work_func(struct work_struct *work)
 				list_add_tail(&next_update->list,
 					 &fb_data->upd_buf_free_list);
 				break;
-			case MERGE_FAIL:
+			case MERGE_FAIL:GALLEN_DBGLOCAL_RUNLOG(6);
 				dev_dbg(fb_data->dev,
 					"Update not merged [collision]\n");
 				break;
-			case MERGE_BLOCK:
+			case MERGE_BLOCK:GALLEN_DBGLOCAL_RUNLOG(7);
 				dev_dbg(fb_data->dev,
 					"Merge blocked [collision]\n");
 				end_merge = true;
@@ -1991,6 +2318,7 @@ static void epdc_submit_work_func(struct work_struct *work)
 			}
 
 			if (end_merge) {
+				GALLEN_DBGLOCAL_RUNLOG(8);
 				end_merge = false;
 				break;
 			}
@@ -2003,6 +2331,7 @@ static void epdc_submit_work_func(struct work_struct *work)
 	 */
 	if (!((fb_data->upd_scheme == UPDATE_SCHEME_QUEUE) &&
 		upd_data_list)) {
+		GALLEN_DBGLOCAL_RUNLOG(9);
 		/*
 		 * If we didn't find a collision update ready to go, we
 		 * need to get a free buffer and match it to a pending update.
@@ -2014,49 +2343,60 @@ static void epdc_submit_work_func(struct work_struct *work)
 		*/
 		if (!upd_data_list &&
 			list_empty(&fb_data->upd_buf_free_list)) {
+			GALLEN_DBGLOCAL_RUNLOG(10);
 			spin_unlock_irqrestore(&fb_data->queue_lock, flags);
+			GALLEN_DBGLOCAL_ESC();
 			return;
 		}
 
 		list_for_each_entry_safe(next_desc, temp_desc,
 				&fb_data->upd_pending_list, list) {
+			GALLEN_DBGLOCAL_RUNLOG(11);		
 
 			dev_dbg(fb_data->dev, "Found a pending update!\n");
 
 			if (!upd_data_list) {
-				if (list_empty(&fb_data->upd_buf_free_list))
+				GALLEN_DBGLOCAL_RUNLOG(12);
+				if (list_empty(&fb_data->upd_buf_free_list)) {
+					GALLEN_DBGLOCAL_RUNLOG(13);
 					break;
+				}
 				upd_data_list =
 					list_entry(fb_data->upd_buf_free_list.next,
 						struct update_data_list, list);
 				list_del_init(&upd_data_list->list);
 				upd_data_list->update_desc = next_desc;
 				list_del_init(&next_desc->list);
-				if (fb_data->upd_scheme == UPDATE_SCHEME_QUEUE)
+				if (fb_data->upd_scheme == UPDATE_SCHEME_QUEUE) {
+					GALLEN_DBGLOCAL_RUNLOG(14);
 					/* If not merging, we have an update */
 					break;
+				}
 			} else {
+				GALLEN_DBGLOCAL_RUNLOG(15);
 				switch (epdc_submit_merge(upd_data_list->update_desc,
-						next_desc)) {
-				case MERGE_OK:
+						next_desc, fb_data->merge_on_waveform_mismatch)) {
+				case MERGE_OK:GALLEN_DBGLOCAL_RUNLOG(16);
 					dev_dbg(fb_data->dev,
 						"Update merged [queue]\n");
 					list_del_init(&next_desc->list);
 					kfree(next_desc);
 					break;
-				case MERGE_FAIL:
+				case MERGE_FAIL:GALLEN_DBGLOCAL_RUNLOG(17);
 					dev_dbg(fb_data->dev,
 						"Update not merged [queue]\n");
 					break;
-				case MERGE_BLOCK:
+				case MERGE_BLOCK:GALLEN_DBGLOCAL_RUNLOG(18);
 					dev_dbg(fb_data->dev,
 						"Merge blocked [collision]\n");
 					end_merge = true;
 					break;
 				}
 
-				if (end_merge)
+				if (end_merge) {
+					GALLEN_DBGLOCAL_RUNLOG(19);
 					break;
+				}
 			}
 		}
 	}
@@ -2065,8 +2405,10 @@ static void epdc_submit_work_func(struct work_struct *work)
 	spin_unlock_irqrestore(&fb_data->queue_lock, flags);
 
 	/* Is update list empty? */
-	if (!upd_data_list)
+	if (!upd_data_list) {
+		GALLEN_DBGLOCAL_ESC();
 		return;
+	}
 
 	/* Perform PXP processing - EPDC power will also be enabled */
 	if (epdc_process_update(upd_data_list, fb_data)) {
@@ -2081,6 +2423,7 @@ static void epdc_submit_work_func(struct work_struct *work)
 			&fb_data->upd_buf_free_list);
 		/* Release buffer queues */
 		spin_unlock_irqrestore(&fb_data->queue_lock, flags);
+		GALLEN_DBGLOCAL_ESC();
 		return;
 	}
 
@@ -2098,6 +2441,7 @@ static void epdc_submit_work_func(struct work_struct *work)
 	 * to become free. The IST will signal this event.
 	 */
 	if (fb_data->cur_update != NULL) {
+		GALLEN_DBGLOCAL_RUNLOG(20);
 		dev_dbg(fb_data->dev, "working buf busy!\n");
 
 		/* Initialize event signalling an update resource is free */
@@ -2117,6 +2461,7 @@ static void epdc_submit_work_func(struct work_struct *work)
 	 * The IST will signal this event.
 	 */
 	if (!epdc_any_luts_available()) {
+		GALLEN_DBGLOCAL_RUNLOG(21);
 		dev_dbg(fb_data->dev, "no luts available!\n");
 
 		/* Initialize event signalling an update resource is free */
@@ -2159,7 +2504,12 @@ static void epdc_submit_work_func(struct work_struct *work)
 
 		/* Leave spinlock while waiting for EOF event */
 		spin_unlock_irqrestore(&fb_data->queue_lock, flags);
-		wait_for_completion(&fb_data->eof_event);
+		ret = wait_for_completion_timeout(&fb_data->eof_event,
+			msecs_to_jiffies(1000));
+		if (!ret) {
+			dev_err(fb_data->dev, "Missed EOF event!\n");
+			epdc_eof_intr(false);
+		}
 		udelay(fb_data->eof_sync_period);
 		spin_lock_irqsave(&fb_data->queue_lock, flags);
 
@@ -2186,10 +2536,13 @@ static void epdc_submit_work_func(struct work_struct *work)
 
 	/* Program EPDC update to process buffer */
 	if (upd_data_list->update_desc->upd_data.temp != TEMP_USE_AMBIENT) {
+		GALLEN_DBGLOCAL_RUNLOG(22);
 		temp_index = mxc_epdc_fb_get_temp_index(fb_data,
 			upd_data_list->update_desc->upd_data.temp);
 		epdc_set_temp(temp_index);
-	}
+	} else
+		epdc_set_temp(fb_data->temp_index);
+	
 	epdc_set_update_addr(upd_data_list->phys_addr
 				+ upd_data_list->update_desc->epdc_offs);
 	epdc_set_update_coord(adj_update_region.left, adj_update_region.top);
@@ -2202,6 +2555,8 @@ static void epdc_submit_work_func(struct work_struct *work)
 
 	/* Release buffer queues */
 	spin_unlock_irqrestore(&fb_data->queue_lock, flags);
+	
+	GALLEN_DBGLOCAL_END();
 }
 
 
@@ -2218,10 +2573,19 @@ int mxc_epdc_fb_send_update(struct mxcfb_update_data *upd_data,
 	struct update_desc_list *upd_desc;
 	struct update_marker_data *marker_data, *next_marker, *temp_marker;
 
+	GALLEN_DBGLOCAL_MUTEBEGIN();
+	GALLEN_DBGLOCAL_PRINTMSG("%s:upd rect={%u,%u,%u,%u},\n\twfmode=%u,updmode=%u,updmarker=%u,flags=0x%x\n",__FUNCTION__,
+			upd_data->update_region.left,upd_data->update_region.top,
+			upd_data->update_region.width,upd_data->update_region.height,
+			upd_data->waveform_mode,upd_data->update_mode,upd_data->update_marker,
+			upd_data->flags);
+
+	
 	/* Has EPDC HW been initialized? */
 	if (!fb_data->hw_ready) {
 		dev_err(fb_data->dev, "Display HW not properly initialized."
 			"  Aborting update.\n");
+		GALLEN_DBGLOCAL_ESC();
 		return -EPERM;
 	}
 
@@ -2231,6 +2595,7 @@ int mxc_epdc_fb_send_update(struct mxcfb_update_data *upd_data,
 		dev_err(fb_data->dev,
 			"Update mode 0x%x is invalid.  Aborting update.\n",
 			upd_data->update_mode);
+		GALLEN_DBGLOCAL_ESC();
 		return -EINVAL;
 	}
 	if ((upd_data->waveform_mode > 255) &&
@@ -2239,16 +2604,26 @@ int mxc_epdc_fb_send_update(struct mxcfb_update_data *upd_data,
 			"Update waveform mode 0x%x is invalid."
 			"  Aborting update.\n",
 			upd_data->waveform_mode);
+		GALLEN_DBGLOCAL_ESC();
 		return -EINVAL;
 	}
 	if ((upd_data->update_region.left + upd_data->update_region.width > fb_data->epdc_fb_var.xres) ||
 		(upd_data->update_region.top + upd_data->update_region.height > fb_data->epdc_fb_var.yres)) {
 		dev_err(fb_data->dev,
-			"Update region is outside bounds of framebuffer."
-			"Aborting update.\n");
+			"Update region is outside bounds of framebuffer.(left,top=(%d,%d),w=%d,h=%d,panelw=%d,panelh=%d)"
+			"Aborting update.\n",upd_data->update_region.left,upd_data->update_region.top,\
+			upd_data->update_region.width,upd_data->update_region.height,\
+			fb_data->epdc_fb_var.xres,fb_data->epdc_fb_var.yres);
+		GALLEN_DBGLOCAL_ESC();
 		return -EINVAL;
 	}
+	
+
+	k_set_temperature(info);
+	
+	
 	if (upd_data->flags & EPDC_FLAG_USE_ALT_BUFFER) {
+		GALLEN_DBGLOCAL_RUNLOG(0);
 		if ((upd_data->update_region.width !=
 			upd_data->alt_buffer_data.alt_update_region.width) ||
 			(upd_data->update_region.height !=
@@ -2256,6 +2631,7 @@ int mxc_epdc_fb_send_update(struct mxcfb_update_data *upd_data,
 			dev_err(fb_data->dev,
 				"Alternate update region dimensions must "
 				"match screen update region dimensions.\n");
+			GALLEN_DBGLOCAL_ESC();
 			return -EINVAL;
 		}
 		/* Validate physical address parameter */
@@ -2266,6 +2642,7 @@ int mxc_epdc_fb_send_update(struct mxcfb_update_data *upd_data,
 			dev_err(fb_data->dev,
 				"Invalid physical address for alternate "
 				"buffer.  Aborting update...\n");
+			GALLEN_DBGLOCAL_ESC();
 			return -EINVAL;
 		}
 	}
@@ -2277,14 +2654,16 @@ int mxc_epdc_fb_send_update(struct mxcfb_update_data *upd_data,
 	 * we do not accept new updates
 	 */
 	if ((fb_data->waiting_for_idle) ||
-		(fb_data->blank != FB_BLANK_UNBLANK)) {
+		((fb_data->blank != FB_BLANK_UNBLANK) && (fb_data->blank != FB_BLANK_NORMAL))) {
 		dev_dbg(fb_data->dev, "EPDC not active."
 			"Update request abort.\n");
 		spin_unlock_irqrestore(&fb_data->queue_lock, flags);
+		GALLEN_DBGLOCAL_ESC();
 		return -EPERM;
 	}
 
 	if (fb_data->upd_scheme == UPDATE_SCHEME_SNAPSHOT) {
+		GALLEN_DBGLOCAL_RUNLOG(1);
 		/*
 		 * Get available intermediate (PxP output) buffer to hold
 		 * processed update region
@@ -2293,6 +2672,7 @@ int mxc_epdc_fb_send_update(struct mxcfb_update_data *upd_data,
 			dev_err(fb_data->dev,
 				"No free intermediate buffers available.\n");
 			spin_unlock_irqrestore(&fb_data->queue_lock, flags);
+			GALLEN_DBGLOCAL_ESC();
 			return -ENOMEM;
 		}
 
@@ -2310,31 +2690,63 @@ int mxc_epdc_fb_send_update(struct mxcfb_update_data *upd_data,
 	 */
 	upd_desc = kzalloc(sizeof(struct update_desc_list), GFP_KERNEL);
 	if (!upd_desc) {
+		GALLEN_DBGLOCAL_RUNLOG(2);
 		dev_err(fb_data->dev,
 			"Insufficient system memory for update! Aborting.\n");
 		if (fb_data->upd_scheme == UPDATE_SCHEME_SNAPSHOT) {
+			GALLEN_DBGLOCAL_RUNLOG(3);
 			list_add(&upd_data_list->list,
 				&fb_data->upd_buf_free_list);
 		}
 		spin_unlock_irqrestore(&fb_data->queue_lock, flags);
+		GALLEN_DBGLOCAL_ESC();
 		return -EPERM;
 	}
+	
+	
+		
 	/* Initialize per-update marker list */
 	INIT_LIST_HEAD(&upd_desc->upd_marker_list);
 	upd_desc->upd_data = *upd_data;
 	upd_desc->update_order = fb_data->order_cnt++;
 	list_add_tail(&upd_desc->list, &fb_data->upd_pending_list);
 
+	// LV panel & LV waveform test
+	{ 
+		unsigned char bModeVersion = *(gpbWF_vaddr+0x10);
+		if( 0x4 == bModeVersion ) {
+			DBG_MSG("Mode Ver=4\n");
+			if(2==upd_desc->upd_data.waveform_mode && 
+				upd_desc->upd_data.update_mode == UPDATE_MODE_PARTIAL) 
+			{
+				DBG_MSG("WF Mode version=0x%02x,chg W.F Mode 2->5 @ partial\n",bModeVersion);
+				upd_desc->upd_data.waveform_mode = 5;
+			}
+		}
+		else if( 0x1==bModeVersion || 0x2==bModeVersion ) {
+			if(4==upd_desc->upd_data.waveform_mode) {
+				// there is no A2 mode in this waveform ...
+				DBG_MSG("WF Mode version=0x%02x,chg W.F Mode 4(A2)->1(DU)\n",bModeVersion);
+				upd_desc->upd_data.waveform_mode = 1;// DU mode .
+			}
+		}
+	}
+	
 	/* If marker specified, associate it with a completion */
 	if (upd_data->update_marker != 0) {
+		GALLEN_DBGLOCAL_RUNLOG(4);
 		/* Allocate new update marker and set it up */
 		marker_data = kzalloc(sizeof(struct update_marker_data),
 				GFP_KERNEL);
 		if (!marker_data) {
 			dev_err(fb_data->dev, "No memory for marker!\n");
 			spin_unlock_irqrestore(&fb_data->queue_lock, flags);
+			GALLEN_DBGLOCAL_ESC();
 			return -ENOMEM;
 		}
+		DBG_MSG("[%s] alloc update_marker_data size=%d\n",
+			__FUNCTION__,sizeof(struct update_marker_data));
+			
 		list_add_tail(&marker_data->upd_list,
 			&upd_desc->upd_marker_list);
 		marker_data->update_marker = upd_data->update_marker;
@@ -2354,6 +2766,8 @@ int mxc_epdc_fb_send_update(struct mxcfb_update_data *upd_data,
 		queue_work(fb_data->epdc_submit_workqueue,
 			&fb_data->epdc_submit_work);
 
+
+		GALLEN_DBGLOCAL_ESC();
 		return 0;
 	}
 
@@ -2374,11 +2788,13 @@ int mxc_epdc_fb_send_update(struct mxcfb_update_data *upd_data,
 	ret = epdc_process_update(upd_data_list, fb_data);
 	if (ret) {
 		mutex_unlock(&fb_data->pxp_mutex);
+		GALLEN_DBGLOCAL_ESC();
 		return ret;
 	}
 
 	/* Pass selected waveform mode back to user */
 	upd_data->waveform_mode = upd_desc->upd_data.waveform_mode;
+
 
 	/* Get rotation-adjusted coordinates */
 	adjust_coordinates(fb_data, &upd_desc->upd_data.update_region,
@@ -2398,6 +2814,7 @@ int mxc_epdc_fb_send_update(struct mxcfb_update_data *upd_data,
 
 		/* Return and allow the update to be submitted by the ISR. */
 		spin_unlock_irqrestore(&fb_data->queue_lock, flags);
+		GALLEN_DBGLOCAL_ESC();
 		return 0;
 	}
 
@@ -2438,17 +2855,21 @@ int mxc_epdc_fb_send_update(struct mxcfb_update_data *upd_data,
 	epdc_set_update_dimensions(screen_upd_region->width,
 		screen_upd_region->height);
 	if (upd_desc->upd_data.temp != TEMP_USE_AMBIENT) {
+		GALLEN_DBGLOCAL_RUNLOG(6);
 		temp_index = mxc_epdc_fb_get_temp_index(fb_data,
 			upd_desc->upd_data.temp);
 		epdc_set_temp(temp_index);
-	} else
+	} else {
+		GALLEN_DBGLOCAL_RUNLOG(7);
 		epdc_set_temp(fb_data->temp_index);
+	}
 
 	epdc_submit_update(upd_data_list->lut_num,
 			   upd_desc->upd_data.waveform_mode,
 			   upd_desc->upd_data.update_mode, false, 0);
 
 	spin_unlock_irqrestore(&fb_data->queue_lock, flags);
+	GALLEN_DBGLOCAL_END();
 	return 0;
 }
 EXPORT_SYMBOL(mxc_epdc_fb_send_update);
@@ -2462,10 +2883,14 @@ int mxc_epdc_fb_wait_update_complete(u32 update_marker, struct fb_info *info)
 	unsigned long flags;
 	bool marker_found = false;
 	int ret = 0;
+	
+	GALLEN_DBGLOCAL_BEGIN();
 
 	/* 0 is an invalid update_marker value */
-	if (update_marker == 0)
+	if (update_marker == 0) {
+		GALLEN_DBGLOCAL_ESC();
 		return -EINVAL;
+	}
 
 	/*
 	 * Find completion associated with update_marker requested.
@@ -2478,7 +2903,9 @@ int mxc_epdc_fb_wait_update_complete(u32 update_marker, struct fb_info *info)
 
 	list_for_each_entry_safe(next_marker, temp,
 		&fb_data->full_marker_list, full_list) {
+		GALLEN_DBGLOCAL_RUNLOG(0);
 		if (next_marker->update_marker == update_marker) {
+			GALLEN_DBGLOCAL_RUNLOG(1);
 			dev_dbg(fb_data->dev, "Waiting for marker %d\n",
 				update_marker);
 			next_marker->waiting = true;
@@ -2493,12 +2920,15 @@ int mxc_epdc_fb_wait_update_complete(u32 update_marker, struct fb_info *info)
 	 * If marker not found, it has either been signalled already
 	 * or the update request failed.  In either case, just return.
 	 */
-	if (!marker_found)
+	if (!marker_found) {
+		GALLEN_DBGLOCAL_ESC();
 		return ret;
+	}
 
 	ret = wait_for_completion_timeout(&next_marker->update_completion,
 						msecs_to_jiffies(5000));
 	if (!ret) {
+		GALLEN_DBGLOCAL_RUNLOG(2);
 		dev_err(fb_data->dev,
 			"Timed out waiting for update completion\n");
 		list_del_init(&next_marker->full_list);
@@ -2508,6 +2938,7 @@ int mxc_epdc_fb_wait_update_complete(u32 update_marker, struct fb_info *info)
 	/* Free update marker object */
 	kfree(next_marker);
 
+	GALLEN_DBGLOCAL_END();
 	return ret;
 }
 EXPORT_SYMBOL(mxc_epdc_fb_wait_update_complete);
@@ -2538,87 +2969,125 @@ static int mxc_epdc_fb_ioctl(struct fb_info *info, unsigned int cmd,
 {
 	void __user *argp = (void __user *)arg;
 	int ret = -EINVAL;
+	GALLEN_DBGLOCAL_BEGIN();
+	
+	fake_s1d13522_progress_stop();
+	
 
 	switch (cmd) {
-	case MXCFB_SET_WAVEFORM_MODES:
+	case MXCFB_SET_WAVEFORM_MODES: GALLEN_DBGLOCAL_RUNLOG(0);
 		{
 			struct mxcfb_waveform_modes modes;
 			if (!copy_from_user(&modes, argp, sizeof(modes))) {
+				GALLEN_DBGLOCAL_RUNLOG(1);
 				mxc_epdc_fb_set_waveform_modes(&modes, info);
 				ret = 0;
 			}
 			break;
 		}
-	case MXCFB_SET_TEMPERATURE:
+	case MXCFB_SET_TEMPERATURE: GALLEN_DBGLOCAL_RUNLOG(2);
 		{
 			int temperature;
-			if (!get_user(temperature, (int32_t __user *) arg))
+			if (!get_user(temperature, (int32_t __user *) arg)) {
+				GALLEN_DBGLOCAL_RUNLOG(3);
 				ret = mxc_epdc_fb_set_temperature(temperature,
 					info);
+			}
 			break;
 		}
-	case MXCFB_SET_AUTO_UPDATE_MODE:
+	case MXCFB_SET_AUTO_UPDATE_MODE:GALLEN_DBGLOCAL_RUNLOG(4);
 		{
 			u32 auto_mode = 0;
-			if (!get_user(auto_mode, (__u32 __user *) arg))
+			if (!get_user(auto_mode, (__u32 __user *) arg)) {
+				GALLEN_DBGLOCAL_RUNLOG(5);
 				ret = mxc_epdc_fb_set_auto_update(auto_mode,
 					info);
+			}
 			break;
 		}
-	case MXCFB_SET_UPDATE_SCHEME:
+	case MXCFB_SET_UPDATE_SCHEME:GALLEN_DBGLOCAL_RUNLOG(6);
 		{
 			u32 upd_scheme = 0;
-			if (!get_user(upd_scheme, (__u32 __user *) arg))
+			if (!get_user(upd_scheme, (__u32 __user *) arg)) {
+				GALLEN_DBGLOCAL_RUNLOG(7);
 				ret = mxc_epdc_fb_set_upd_scheme(upd_scheme,
 					info);
+			}
 			break;
 		}
-	case MXCFB_SEND_UPDATE:
+	case MXCFB_SEND_UPDATE:GALLEN_DBGLOCAL_RUNLOG(8);
 		{
 			struct mxcfb_update_data upd_data;
+			//printk("MXCFB_SEND_UPDATE:0x%x\n",MXCFB_SEND_UPDATE);
 			if (!copy_from_user(&upd_data, argp,
 				sizeof(upd_data))) {
+				GALLEN_DBGLOCAL_RUNLOG(9);	
 				ret = mxc_epdc_fb_send_update(&upd_data, info);
 				if (ret == 0 && copy_to_user(argp, &upd_data,
-					sizeof(upd_data)))
+					sizeof(upd_data))) {
+					GALLEN_DBGLOCAL_RUNLOG(10);
 					ret = -EFAULT;
+				}
 			} else {
+				GALLEN_DBGLOCAL_RUNLOG(11);
 				ret = -EFAULT;
 			}
 
 			break;
 		}
-	case MXCFB_WAIT_FOR_UPDATE_COMPLETE:
+	case MXCFB_WAIT_FOR_UPDATE_COMPLETE:GALLEN_DBGLOCAL_RUNLOG(12);
 		{
 			u32 update_marker = 0;
-			if (!get_user(update_marker, (__u32 __user *) arg))
+			if (!get_user(update_marker, (__u32 __user *) arg)) {
+				GALLEN_DBGLOCAL_RUNLOG(13);
 				ret =
 				    mxc_epdc_fb_wait_update_complete(update_marker,
 					info);
+			}
 			break;
 		}
 
-	case MXCFB_SET_PWRDOWN_DELAY:
+	case MXCFB_SET_PWRDOWN_DELAY:GALLEN_DBGLOCAL_RUNLOG(14);
 		{
 			int delay = 0;
 			if (!get_user(delay, (__u32 __user *) arg))
+			{
+				GALLEN_DBGLOCAL_RUNLOG(15);
 				ret =
 				    mxc_epdc_fb_set_pwrdown_delay(delay, info);
+			}
 			break;
 		}
 
-	case MXCFB_GET_PWRDOWN_DELAY:
+	case MXCFB_GET_PWRDOWN_DELAY:GALLEN_DBGLOCAL_RUNLOG(16);
 		{
 			int pwrdown_delay = mxc_epdc_get_pwrdown_delay(info);
 			if (put_user(pwrdown_delay,
 				(int __user *)argp))
+			{
+				GALLEN_DBGLOCAL_RUNLOG(17);
+					
 				ret = -EFAULT;
+			}
 			ret = 0;
 			break;
 		}
-	default:
+
+	case MXCFB_SET_MERGE_ON_WAVEFORM_MISMATCH:
+		{
+			int merge = 1;
+			if (!get_user(merge, (int __user *) arg))
+				ret = mxc_epdc_fb_set_merge_on_waveform_mismatch(merge, info);
+			break;
+		}
+
+	default:GALLEN_DBGLOCAL_RUNLOG(18);
+		{
+			ret = k_fake_s1d13522_ioctl(cmd,arg);
+		}
 		break;
 	}
+	GALLEN_DBGLOCAL_END();
 	return ret;
 }
 
@@ -2626,6 +3095,7 @@ static void mxc_epdc_fb_update_pages(struct mxc_epdc_fb_data *fb_data,
 				     u16 y1, u16 y2)
 {
 	struct mxcfb_update_data update;
+	GALLEN_DBGLOCAL_BEGIN();
 
 	/* Do partial screen update, Update full horizontal lines */
 	update.update_region.left = 0;
@@ -2639,6 +3109,8 @@ static void mxc_epdc_fb_update_pages(struct mxc_epdc_fb_data *fb_data,
 	update.flags = 0;
 
 	mxc_epdc_fb_send_update(&update, &fb_data->info);
+	
+	GALLEN_DBGLOCAL_END();
 }
 
 /* this is called back from the deferred io workqueue */
@@ -2675,9 +3147,15 @@ void mxc_epdc_fb_flush_updates(struct mxc_epdc_fb_data *fb_data)
 {
 	unsigned long flags;
 	int ret;
+	
+	GALLEN_DBGLOCAL_BEGIN();
 	/* Grab queue lock to prevent any new updates from being submitted */
 	spin_lock_irqsave(&fb_data->queue_lock, flags);
 
+	GALLEN_DBGLOCAL_PRINTMSG("list_empty=%d\n",list_empty(&fb_data->upd_pending_list));
+	GALLEN_DBGLOCAL_PRINTMSG("is_free_list_full=%d\n",is_free_list_full(fb_data));
+	GALLEN_DBGLOCAL_PRINTMSG("power_state=%d,power_down=%d\n",fb_data->power_state,fb_data->powering_down);
+		
 	/*
 	 * 3 places to check for updates that are active or pending:
 	 *   1) Updates in the pending list
@@ -2685,10 +3163,21 @@ void mxc_epdc_fb_flush_updates(struct mxc_epdc_fb_data *fb_data)
 	 *   3) Active updates to panel - We can key off of EPDC
 	 *      power state to know if we have active updates.
 	 */
+	#if 0 
+	/* gallen modify 20110704 : if there is no update list in queue 
+		,this condition will cause update timeout 5 secs .
+	*/
 	if (!list_empty(&fb_data->upd_pending_list) ||
 		!is_free_list_full(fb_data) ||
 		((fb_data->power_state == POWER_STATE_ON) &&
-		!fb_data->powering_down)) {
+		!fb_data->powering_down)) 
+	#else
+	if (!list_empty(&fb_data->upd_pending_list) ||
+		!is_free_list_full(fb_data) )
+	#endif
+	{
+		GALLEN_DBGLOCAL_RUNLOG(0);
+		
 		/* Initialize event signalling updates are done */
 		init_completion(&fb_data->updates_done);
 		fb_data->waiting_for_idle = true;
@@ -2697,15 +3186,19 @@ void mxc_epdc_fb_flush_updates(struct mxc_epdc_fb_data *fb_data)
 		/* Wait for any currently active updates to complete */
 		ret = wait_for_completion_timeout(&fb_data->updates_done,
 						msecs_to_jiffies(5000));
-		if (!ret)
+		if (!ret) 
+		{
+			GALLEN_DBGLOCAL_RUNLOG(1);
 			dev_err(fb_data->dev,
 				"Flush updates timeout! ret = 0x%x\n", ret);
+		}
 
 		spin_lock_irqsave(&fb_data->queue_lock, flags);
 		fb_data->waiting_for_idle = false;
 	}
 
 	spin_unlock_irqrestore(&fb_data->queue_lock, flags);
+	GALLEN_DBGLOCAL_END();
 }
 
 static int mxc_epdc_fb_blank(int blank, struct fb_info *info)
@@ -2713,19 +3206,24 @@ static int mxc_epdc_fb_blank(int blank, struct fb_info *info)
 	struct mxc_epdc_fb_data *fb_data = (struct mxc_epdc_fb_data *)info;
 	int ret;
 
+	GALLEN_DBGLOCAL_BEGIN();
 	dev_dbg(fb_data->dev, "blank = %d\n", blank);
 
 	if (fb_data->blank == blank)
+	{
+		GALLEN_DBGLOCAL_ESC();
 		return 0;
+	}
 
-	fb_data->blank = blank;
+	//fb_data->blank = blank;
 
 	switch (blank) {
-	case FB_BLANK_POWERDOWN:
+	case FB_BLANK_POWERDOWN:GALLEN_DBGLOCAL_RUNLOG(0);
 		mxc_epdc_fb_flush_updates(fb_data);
 		/* Wait for powerdown */
 		mutex_lock(&fb_data->power_mutex);
 		if (fb_data->power_state != POWER_STATE_OFF) {
+			GALLEN_DBGLOCAL_RUNLOG(1);
 			fb_data->wait_for_powerdown = true;
 			init_completion(&fb_data->powerdown_compl);
 			mutex_unlock(&fb_data->power_mutex);
@@ -2734,17 +3232,20 @@ static int mxc_epdc_fb_blank(int blank, struct fb_info *info)
 			if (!ret) {
 				dev_err(fb_data->dev,
 					"No powerdown received!\n");
+				GALLEN_DBGLOCAL_ESC();
 				return -ETIMEDOUT;
 			}
 		} else
 			mutex_unlock(&fb_data->power_mutex);
 		break;
-	case FB_BLANK_VSYNC_SUSPEND:
-	case FB_BLANK_HSYNC_SUSPEND:
-	case FB_BLANK_NORMAL:
+	case FB_BLANK_VSYNC_SUSPEND:GALLEN_DBGLOCAL_RUNLOG(1);
+	case FB_BLANK_HSYNC_SUSPEND:GALLEN_DBGLOCAL_RUNLOG(2);
+	case FB_BLANK_NORMAL:GALLEN_DBGLOCAL_RUNLOG(3);
 		mxc_epdc_fb_flush_updates(fb_data);
 		break;
 	}
+	
+	GALLEN_DBGLOCAL_END();
 	return 0;
 }
 
@@ -2754,6 +3255,8 @@ static int mxc_epdc_fb_pan_display(struct fb_var_screeninfo *var,
 	struct mxc_epdc_fb_data *fb_data = (struct mxc_epdc_fb_data *)info;
 	u_int y_bottom;
 	unsigned long flags;
+	
+	GALLEN_DBGLOCAL_BEGIN();
 
 	dev_dbg(info->device, "%s: var->yoffset %d, info->var.yoffset %d\n",
 		 __func__, var->yoffset, info->var.yoffset);
@@ -2761,20 +3264,25 @@ static int mxc_epdc_fb_pan_display(struct fb_var_screeninfo *var,
 	if (!var || (var->xoffset != info->var.xoffset) ||
 	    (var->yoffset + var->yres > var->yres_virtual)) {
 		dev_dbg(info->device, "x panning not supported\n");
+		GALLEN_DBGLOCAL_ESC();
 		return -EINVAL;
 	}
 
 	if ((fb_data->epdc_fb_var.xoffset == var->xoffset) &&
-		(fb_data->epdc_fb_var.yoffset == var->yoffset))
+		(fb_data->epdc_fb_var.yoffset == var->yoffset)) {
+		GALLEN_DBGLOCAL_ESC();
 		return 0;	/* No change, do nothing */
+	}
 
 	y_bottom = var->yoffset;
 
 	if (!(var->vmode & FB_VMODE_YWRAP))
 		y_bottom += var->yres;
 
-	if (y_bottom > info->var.yres_virtual)
+	if (y_bottom > info->var.yres_virtual) {
+		GALLEN_DBGLOCAL_ESC();
 		return -EINVAL;
+	}
 
 	spin_lock_irqsave(&fb_data->queue_lock, flags);
 
@@ -2784,13 +3292,18 @@ static int mxc_epdc_fb_pan_display(struct fb_var_screeninfo *var,
 	fb_data->epdc_fb_var.xoffset = var->xoffset;
 	fb_data->epdc_fb_var.yoffset = var->yoffset;
 
-	if (var->vmode & FB_VMODE_YWRAP)
+	if (var->vmode & FB_VMODE_YWRAP) {
+		GALLEN_DBGLOCAL_RUNLOG(0);
 		info->var.vmode |= FB_VMODE_YWRAP;
-	else
+	}
+	else {
+		GALLEN_DBGLOCAL_RUNLOG(1);
 		info->var.vmode &= ~FB_VMODE_YWRAP;
+	}
 
 	spin_unlock_irqrestore(&fb_data->queue_lock, flags);
 
+	GALLEN_DBGLOCAL_END();
 	return 0;
 }
 
@@ -2852,7 +3365,9 @@ static irqreturn_t mxc_epdc_irq_handler(int irq, void *dev_id)
 	int i;
 	bool wb_lut_done = false;
 	bool free_update = true;
-	int ret, next_lut;
+	int next_lut;
+	u32 epdc_irq_stat, epdc_luts_active, epdc_wb_busy, epdc_luts_avail;
+	u32 epdc_collision, epdc_colliding_luts, epdc_next_lut_15;
 
 	/*
 	 * If we just completed one-time panel init, bypass
@@ -2887,16 +3402,26 @@ static irqreturn_t mxc_epdc_irq_handler(int irq, void *dev_id)
 
 	/* Check if we are waiting on EOF to sync a new update submission */
 	if (epdc_signal_eof()) {
+		epdc_eof_intr(false);
 		epdc_clear_eof_irq();
 		complete(&fb_data->eof_event);
 	}
+
+	/* Capture EPDC status one time up front to prevent race conditions */
+	epdc_irq_stat = __raw_readl(EPDC_IRQ);
+	epdc_luts_active = epdc_any_luts_active();
+	epdc_wb_busy = epdc_is_working_buffer_busy();
+	epdc_luts_avail = epdc_any_luts_available();
+	epdc_collision = epdc_is_collision();
+	epdc_colliding_luts = epdc_get_colliding_luts();
+	epdc_next_lut_15 = epdc_choose_next_lut(&next_lut);
 
 	/* Protect access to buffer queues and to update HW */
 	spin_lock_irqsave(&fb_data->queue_lock, flags);
 
 	/* Free any LUTs that have completed */
 	for (i = 0; i < EPDC_NUM_LUTS; i++) {
-		if (!epdc_is_lut_complete(i))
+		if (!(epdc_irq_stat & (1 << i)))
 			continue;
 
 		dev_dbg(fb_data->dev, "\nLUT %d completed\n", i);
@@ -2964,7 +3489,9 @@ static irqreturn_t mxc_epdc_irq_handler(int irq, void *dev_id)
 	if (list_empty(&fb_data->upd_pending_list) &&
 		is_free_list_full(fb_data) &&
 		(fb_data->cur_update == NULL) &&
-		!epdc_any_luts_active()) {
+		!epdc_luts_active) {
+
+        fb_data->updates_active = false;
 
 		if (fb_data->pwrdown_delay != FB_POWERDOWN_DISABLE) {
 			/*
@@ -2986,7 +3513,7 @@ static irqreturn_t mxc_epdc_irq_handler(int irq, void *dev_id)
 	}
 
 	/* Is Working Buffer busy? */
-	if (epdc_is_working_buffer_busy()) {
+	if (epdc_wb_busy) {
 		/* Can't submit another update until WB is done */
 		spin_unlock_irqrestore(&fb_data->queue_lock, flags);
 		return IRQ_HANDLED;
@@ -3112,15 +3639,14 @@ static irqreturn_t mxc_epdc_irq_handler(int irq, void *dev_id)
 	/* Snapshot update scheme processing */
 
 	/* Check to see if any LUTs are free */
-	if (!epdc_any_luts_available()) {
+	if (!epdc_luts_avail) {
 		dev_dbg(fb_data->dev, "No luts available.\n");
 		spin_unlock_irqrestore(&fb_data->queue_lock, flags);
 		return IRQ_HANDLED;
 	}
 
 	/* Check to see if there is a valid LUT to use */
-	ret = epdc_choose_next_lut(&next_lut);
-	if (ret && fb_data->tce_prevent) {
+	if (epdc_next_lut_15 && fb_data->tce_prevent) {
 		dev_dbg(fb_data->dev, "Must wait for LUT15\n");
 		spin_unlock_irqrestore(&fb_data->queue_lock, flags);
 		return IRQ_HANDLED;
@@ -3220,6 +3746,7 @@ static void draw_mode0(struct mxc_epdc_fb_data *fb_data)
 	struct fb_var_screeninfo *screeninfo = &fb_data->epdc_fb_var;
 	u32 xres, yres;
 
+	GALLEN_DBGLOCAL_BEGIN();
 	upd_buf_ptr = (u32 *)fb_data->info.screen_base;
 
 	epdc_working_buf_intr(true);
@@ -3229,9 +3756,11 @@ static void draw_mode0(struct mxc_epdc_fb_data *fb_data)
 	/* Use unrotated (native) width/height */
 	if ((screeninfo->rotate == FB_ROTATE_CW) ||
 		(screeninfo->rotate == FB_ROTATE_CCW)) {
+		GALLEN_DBGLOCAL_RUNLOG(0);
 		xres = screeninfo->yres;
 		yres = screeninfo->xres;
 	} else {
+		GALLEN_DBGLOCAL_RUNLOG(1);
 		xres = screeninfo->xres;
 		yres = screeninfo->yres;
 	}
@@ -3249,13 +3778,14 @@ static void draw_mode0(struct mxc_epdc_fb_data *fb_data)
 	for (i = 0; i < 40; i++) {
 		if (!epdc_is_lut_active(0)) {
 			dev_dbg(fb_data->dev, "Mode0 init complete\n");
+			GALLEN_DBGLOCAL_ESC();
 			return;
 		}
 		msleep(100);
 	}
 
 	dev_err(fb_data->dev, "Mode0 init failed!\n");
-
+	GALLEN_DBGLOCAL_END();
 	return;
 }
 
@@ -3272,33 +3802,90 @@ static void mxc_epdc_fb_fw_handler(const struct firmware *fw,
 	struct fb_var_screeninfo *screeninfo = &fb_data->epdc_fb_var;
 	u32 xres, yres;
 
+	GALLEN_DBGLOCAL_BEGIN();
+	
+	
 	if (fw == NULL) {
+		GALLEN_DBGLOCAL_RUNLOG(0);
 		/* If default FW file load failed, we give up */
-		if (fb_data->fw_default_load)
+		if (fb_data->fw_default_load) {
+			GALLEN_DBGLOCAL_ESC();
 			return;
+		}
 
 		/* Try to load default waveform */
 		dev_dbg(fb_data->dev,
 			"Can't find firmware. Trying fallback fw\n");
 		fb_data->fw_default_load = true;
+#ifdef FW_IN_RAM//[ gallen modify 20110609 : waveform pass from bootloader in RAM .
+		{
+			struct firmware fw;
+			
+
+			fw.size = gdwWF_size;
+			fw.data = (u8*)gpbWF_vaddr;
+			//fw.page = 0;
+			printk("[%s]:fw p=%p,size=%u\n",__FUNCTION__,fw.data,fw.size);
+			//mxc_epdc_fb_fw_handler(&fw,fb_data);
+			ret = 0;
+		}
+#else //][ befrom modify ...
 		ret = request_firmware_nowait(THIS_MODULE, FW_ACTION_HOTPLUG,
 			"imx/epdc.fw", fb_data->dev, GFP_KERNEL, fb_data,
 			mxc_epdc_fb_fw_handler);
-		if (ret)
+		if (ret) {
+			GALLEN_DBGLOCAL_RUNLOG(1);
 			dev_err(fb_data->dev,
 				"Failed request_firmware_nowait err %d\n", ret);
-
+		}
+#endif //]
+		GALLEN_DBGLOCAL_ESC();
 		return;
 	}
+	
+	
+	GALLEN_DBGLOCAL_PRINTMSG("---fw data = %p,fw size = %ul ---\n",fw->data,fw->size);
 
 	wv_file = (struct mxcfb_waveform_data_file *)fw->data;
+	
+	if(1==gptHWCFG->m_val.bDisplayResolution) {
+		printk("%s(%d):EPD 1024x758 \n",__FILE__,__LINE__);
+		fb_data->cur_mode = &fb_data->pdata->epdc_mode[2];//
+	}
+	else
+	{
+		unsigned char *pbWFHdr = (unsigned char *)(fw->data);
+		switch (*(pbWFHdr+0x0d)) {// FPL platform detect .
+		case 0x06: // V220 .
+			if(27==gptHWCFG->m_val.bPCB) {
+				printk("%s(%d):V220 for E50610 FPL platform \n",__FILE__,__LINE__);
+				fb_data->cur_mode = &fb_data->pdata->epdc_mode[4];//v220 parameters for E50612 .
+			}
+			else {
+				printk("%s(%d):V220 FPL platform \n",__FILE__,__LINE__);
+				fb_data->cur_mode = &fb_data->pdata->epdc_mode[0];//v220 parameters
+			}
+			break;
+		case 0x03: // V110 .
+		case 0x04: // V110A .
+			printk("%s(%d):V110/V110A FPL platform \n",__FILE__,__LINE__);
+			ASSERT(fb_data->pdata->num_modes>1);
+			fb_data->cur_mode = &fb_data->pdata->epdc_mode[1];//v110 parameters
+			break;
+		default:
+			ERR_MSG("%s(%d):new FPL platform=0x%x ,please modify source to support this \n",__FILE__,__LINE__,*(pbWFHdr+0x0d));
+			break;
+		}
+	}
 
 	/* Get size and allocate temperature range table */
 	fb_data->trt_entries = wv_file->wdh.trc + 1;
 	fb_data->temp_range_bounds = kzalloc(fb_data->trt_entries, GFP_KERNEL);
 
-	for (i = 0; i < fb_data->trt_entries; i++)
+	for (i = 0; i < fb_data->trt_entries; i++) {
+		GALLEN_DBGLOCAL_RUNLOG(2);
 		dev_dbg(fb_data->dev, "trt entry #%d = 0x%x\n", i, *((u8 *)&wv_file->data + i));
+	}
 
 	/* Copy TRT data */
 	memcpy(fb_data->temp_range_bounds, &wv_file->data, fb_data->trt_entries);
@@ -3317,13 +3904,22 @@ static void mxc_epdc_fb_fw_handler(const struct firmware *fw,
 						GFP_DMA);
 	if (fb_data->waveform_buffer_virt == NULL) {
 		dev_err(fb_data->dev, "Can't allocate mem for waveform!\n");
+		GALLEN_DBGLOCAL_ESC();
 		return;
 	}
+	DBG_MSG("[%s]waveform:vir_p=%p,phy_p=%p,sz=%d,trt_entries=%d\n",__FUNCTION__,\
+		fb_data->waveform_buffer_virt,fb_data->waveform_buffer_phys,\
+		fb_data->waveform_buffer_size,fb_data->trt_entries);
+	
 
 	memcpy(fb_data->waveform_buffer_virt, (u8 *)(fw->data) + wv_data_offs,
 		fb_data->waveform_buffer_size);
 
+#ifdef FW_IN_RAM//[ gallen modify 20110609 : waveform pass from bootloader in RAM .
+#else//][!FW_IN_RAM
+
 	release_firmware(fw);
+#endif //]FW_IN_RAM
 
 	/* Enable clocks to access EPDC regs */
 	clk_enable(fb_data->epdc_clk_axi);
@@ -3343,13 +3939,16 @@ static void mxc_epdc_fb_fw_handler(const struct firmware *fw,
 	/* Use unrotated (native) width/height */
 	if ((screeninfo->rotate == FB_ROTATE_CW) ||
 		(screeninfo->rotate == FB_ROTATE_CCW)) {
+		GALLEN_DBGLOCAL_RUNLOG(3);
 		xres = screeninfo->yres;
 		yres = screeninfo->xres;
 	} else {
+		GALLEN_DBGLOCAL_RUNLOG(4);
 		xres = screeninfo->xres;
 		yres = screeninfo->yres;
 	}
 
+#if 0 // gallen remove 20110704
 	update.update_region.left = 0;
 	update.update_region.width = xres;
 	update.update_region.top = 0;
@@ -3365,21 +3964,31 @@ static void mxc_epdc_fb_fw_handler(const struct firmware *fw,
 	/* Block on initial update */
 	ret = mxc_epdc_fb_wait_update_complete(update.update_marker,
 		&fb_data->info);
-	if (ret < 0)
+	if (ret < 0) {
+		GALLEN_DBGLOCAL_RUNLOG(5);
 		dev_err(fb_data->dev,
 			"Wait for update complete failed.  Error = 0x%x", ret);
+			
+	}
+#endif 
+	
+	k_fake_s1d13522_init((unsigned char *)gpbLOGO_vaddr);
+	GALLEN_DBGLOCAL_END();
 }
 
 static int mxc_epdc_fb_init_hw(struct fb_info *info)
 {
 	struct mxc_epdc_fb_data *fb_data = (struct mxc_epdc_fb_data *)info;
 	int ret;
+	
+	GALLEN_DBGLOCAL_BEGIN();
 
 	/*
 	 * Create fw search string based on ID string in selected videomode.
 	 * Format is "imx/epdc_[panel string].fw"
 	 */
 	if (fb_data->cur_mode) {
+		GALLEN_DBGLOCAL_RUNLOG(0);
 		strcat(fb_data->fw_str, "imx/epdc_");
 		strcat(fb_data->fw_str, fb_data->cur_mode->vmode->name);
 		strcat(fb_data->fw_str, ".fw");
@@ -3387,13 +3996,37 @@ static int mxc_epdc_fb_init_hw(struct fb_info *info)
 
 	fb_data->fw_default_load = false;
 
+#ifdef FW_IN_RAM//[ gallen modify 20110609 : waveform pass from bootloader in RAM .
+	#if 1
+		queue_work(fb_data->epdc_submit_workqueue,
+			&fb_data->epdc_firmware_work);
+		ret = 0;
+	#else
+	{
+
+		struct firmware fw;
+		
+		fw.size = gdwWF_size;
+		fw.data = gpbWF_vaddr;
+		//fw.page = 0;
+		printk("[%s]:fw p=%p,size=%u\n",__FUNCTION__,fw.data,fw.size);
+		mxc_epdc_fb_fw_handler(&fw,fb_data);
+		ret = 0;
+	}
+	#endif
+#else	//][ befrom modify ...
 	ret = request_firmware_nowait(THIS_MODULE, FW_ACTION_HOTPLUG,
 				fb_data->fw_str, fb_data->dev, GFP_KERNEL,
 				fb_data, mxc_epdc_fb_fw_handler);
-	if (ret)
+	if (ret) 
+	{
+		GALLEN_DBGLOCAL_RUNLOG(1);
 		dev_dbg(fb_data->dev,
 			"Failed request_firmware_nowait err %d\n", ret);
+	}
+#endif //]
 
+	GALLEN_DBGLOCAL_END();
 	return ret;
 }
 
@@ -3405,12 +4038,19 @@ static ssize_t store_update(struct device *device,
 	struct fb_info *info = dev_get_drvdata(device);
 	struct mxc_epdc_fb_data *fb_data = (struct mxc_epdc_fb_data *)info;
 
-	if (strncmp(buf, "direct", 6) == 0)
+	GALLEN_DBGLOCAL_BEGIN();
+	if (strncmp(buf, "direct", 6) == 0) {
+		GALLEN_DBGLOCAL_RUNLOG(0);
 		update.waveform_mode = fb_data->wv_modes.mode_du;
-	else if (strncmp(buf, "gc16", 4) == 0)
+	}
+	else if (strncmp(buf, "gc16", 4) == 0) {
+		GALLEN_DBGLOCAL_RUNLOG(1);
 		update.waveform_mode = fb_data->wv_modes.mode_gc16;
-	else if (strncmp(buf, "gc4", 3) == 0)
+	}
+	else if (strncmp(buf, "gc4", 3) == 0) {
+		GALLEN_DBGLOCAL_RUNLOG(2);
 		update.waveform_mode = fb_data->wv_modes.mode_gc4;
+	}
 
 	/* Now, request full screen update */
 	update.update_region.left = 0;
@@ -3424,6 +4064,7 @@ static ssize_t store_update(struct device *device,
 
 	mxc_epdc_fb_send_update(&update, info);
 
+	GALLEN_DBGLOCAL_END();
 	return count;
 }
 
@@ -3456,61 +4097,109 @@ int __devinit mxc_epdc_fb_probe(struct platform_device *pdev)
 	struct mxcfb_update_data update;
 #endif
 
+	GALLEN_DBGLOCAL_BEGIN_EX(64);
+	
+	if(4!=gptHWCFG->m_val.bDisplayCtrl&&6!=gptHWCFG->m_val.bDisplayCtrl) {
+		// display controller is not mx508 .
+		ERR_MSG("[%s] ignore probe : hwcfg dispctrl not mx508 (is %d).\n",\
+			__FUNCTION__,gptHWCFG->m_val.bDisplayCtrl);
+		return -ENODEV;
+	}
+
+	if(0==gptHWCFG->m_val.bRamSize||1==gptHWCFG->m_val.bRamSize) {
+		// RAM SIZE < 256MB
+		giEPDC_MAX_NUM_UPDATES = 1;
+	}
+	else {
+		giEPDC_MAX_NUM_UPDATES = 10;
+	}
+
 	fb_data = (struct mxc_epdc_fb_data *)framebuffer_alloc(
 			sizeof(struct mxc_epdc_fb_data), &pdev->dev);
 	if (fb_data == NULL) {
+		GALLEN_DBGLOCAL_RUNLOG(0);
 		ret = -ENOMEM;
 		goto out;
 	}
+	
+	DBG_MSG("[%s]epdc_fb_data size=%d\n",__FUNCTION__,sizeof(struct mxc_epdc_fb_data));
 
 	/* Get platform data and check validity */
 	fb_data->pdata = pdev->dev.platform_data;
 	if ((fb_data->pdata == NULL) || (fb_data->pdata->num_modes < 1)
 		|| (fb_data->pdata->epdc_mode == NULL)
 		|| (fb_data->pdata->epdc_mode->vmode == NULL)) {
+		GALLEN_DBGLOCAL_RUNLOG(1);
 		ret = -EINVAL;
 		goto out_fbdata;
 	}
 
 	if (fb_get_options(name, &options)) {
+		GALLEN_DBGLOCAL_RUNLOG(2);
 		ret = -ENODEV;
 		goto out_fbdata;
 	}
 
-	fb_data->tce_prevent = 0;
-
-	if (options)
+	fb_data->tce_prevent = 1;
+	
+	if (options) 
+	{
+		GALLEN_DBGLOCAL_RUNLOG(3);
 		while ((opt = strsep(&options, ",")) != NULL) {
-			if (!*opt)
+			GALLEN_DBGLOCAL_RUNLOG(4);
+			if (!*opt) {
+				GALLEN_DBGLOCAL_RUNLOG(5);
 				continue;
+			}
 
-			if (!strncmp(opt, "bpp=", 4))
+			if (!strncmp(opt, "bpp=", 4)) 
+			{
+				GALLEN_DBGLOCAL_RUNLOG(6);
 				fb_data->default_bpp =
 					simple_strtoul(opt + 4, NULL, 0);
-			else if (!strncmp(opt, "x_mem=", 6))
+			}
+			else if (!strncmp(opt, "x_mem=", 6)) {
+				GALLEN_DBGLOCAL_RUNLOG(7);
 				x_mem_size = memparse(opt + 6, NULL);
-			else if (!strncmp(opt, "tce_prevent", 11))
+			}
+			else if (!strncmp(opt,"tce_prevent",11)) 
+			{
 				fb_data->tce_prevent = 1;
-			else
+			}
+			else {
+				GALLEN_DBGLOCAL_RUNLOG(8);
 				panel_str = opt;
+			}
 		}
+	}
 
 	fb_data->dev = &pdev->dev;
 
-	if (!fb_data->default_bpp)
-		fb_data->default_bpp = 16;
+	if (!fb_data->default_bpp) {
+		GALLEN_DBGLOCAL_RUNLOG(9);
+		fb_data->default_bpp = default_bpp;
+	}
 
 	/* Set default (first defined mode) before searching for a match */
-	fb_data->cur_mode = &fb_data->pdata->epdc_mode[0];
+	if(1==gptHWCFG->m_val.bDisplayResolution) {
+		printk("%s(%d):EPD 1024x758 \n",__FILE__,__LINE__);
+		fb_data->cur_mode = &fb_data->pdata->epdc_mode[2];//
+	}	
+	else {
+		fb_data->cur_mode = &fb_data->pdata->epdc_mode[0];
+	}
 
-	if (panel_str)
+	if (panel_str) {
+		GALLEN_DBGLOCAL_RUNLOG(10);
 		for (i = 0; i < fb_data->pdata->num_modes; i++)
 			if (!strcmp(fb_data->pdata->epdc_mode[i].vmode->name,
 						panel_str)) {
+				GALLEN_DBGLOCAL_RUNLOG(11);
 				fb_data->cur_mode =
 					&fb_data->pdata->epdc_mode[i];
 				break;
 			}
+	}
 
 	vmode = fb_data->cur_mode->vmode;
 
@@ -3519,12 +4208,15 @@ int __devinit mxc_epdc_fb_probe(struct platform_device *pdev)
 
 	/* Allocate color map for the FB */
 	ret = fb_alloc_cmap(&info->cmap, 256, 0);
-	if (ret)
+	if (ret) {
+		GALLEN_DBGLOCAL_RUNLOG(12);
 		goto out_fbdata;
+	}
 
 	dev_dbg(&pdev->dev, "resolution %dx%d, bpp %d\n",
 		vmode->xres, vmode->yres, fb_data->default_bpp);
 
+	DBG_MSG("resolution %dx%d,bpp %d\n",vmode->xres, vmode->yres, fb_data->default_bpp);
 	/*
 	 * GPU alignment restrictions dictate framebuffer parameters:
 	 * - 32-byte alignment for buffer width
@@ -3549,36 +4241,48 @@ int __devinit mxc_epdc_fb_probe(struct platform_device *pdev)
 
 	/* Compute the number of screens needed based on X memory requested */
 	if (x_mem_size > 0) {
+		GALLEN_DBGLOCAL_RUNLOG(13);
 		fb_data->num_screens = DIV_ROUND_UP(x_mem_size, buf_size);
-		if (fb_data->num_screens < NUM_SCREENS_MIN)
+		if (fb_data->num_screens < NUM_SCREENS_MIN) {
+			GALLEN_DBGLOCAL_RUNLOG(14);
 			fb_data->num_screens = NUM_SCREENS_MIN;
-		else if (buf_size * fb_data->num_screens > SZ_16M)
+		}
+		else if (buf_size * fb_data->num_screens > SZ_16M) {
+			GALLEN_DBGLOCAL_RUNLOG(15);
 			fb_data->num_screens = SZ_16M / buf_size;
-	} else
+		}
+	} else  {
+		GALLEN_DBGLOCAL_RUNLOG(16);
 		fb_data->num_screens = NUM_SCREENS_MIN;
+	}
 
 	fb_data->map_size = buf_size * fb_data->num_screens;
 	dev_dbg(&pdev->dev, "memory to allocate: %d\n", fb_data->map_size);
 
+	DBG0_MSG("[%s] memory to allocate: %d,num_screens=%d\n",__FUNCTION__, \
+		fb_data->map_size,fb_data->num_screens);
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	if (res == NULL) {
+		GALLEN_DBGLOCAL_RUNLOG(17);
 		ret = -ENODEV;
 		goto out_cmap;
 	}
 
 	epdc_base = ioremap(res->start, SZ_4K);
 	if (epdc_base == NULL) {
+		GALLEN_DBGLOCAL_RUNLOG(18);
 		ret = -ENOMEM;
 		goto out_cmap;
 	}
 
 	/* Allocate FB memory */
 	info->screen_base = dma_alloc_writecombine(&pdev->dev,
-						  fb_data->map_size,
+						  fb_data->map_size<<1,
 						  &fb_data->phys_start,
 						  GFP_DMA);
 
 	if (info->screen_base == NULL) {
+		GALLEN_DBGLOCAL_RUNLOG(19);
 		ret = -ENOMEM;
 		goto out_mapregs;
 	}
@@ -3604,8 +4308,8 @@ int __devinit mxc_epdc_fb_probe(struct platform_device *pdev)
 	var_info->vmode = FB_VMODE_NONINTERLACED;
 
 	switch (fb_data->default_bpp) {
-	case 32:
-	case 24:
+	case 32:GALLEN_DBGLOCAL_RUNLOG(20);
+	case 24:GALLEN_DBGLOCAL_RUNLOG(21);
 		var_info->red.offset = 16;
 		var_info->red.length = 8;
 		var_info->green.offset = 8;
@@ -3614,7 +4318,7 @@ int __devinit mxc_epdc_fb_probe(struct platform_device *pdev)
 		var_info->blue.length = 8;
 		break;
 
-	case 16:
+	case 16:GALLEN_DBGLOCAL_RUNLOG(22);
 		var_info->red.offset = 11;
 		var_info->red.length = 5;
 		var_info->green.offset = 5;
@@ -3623,7 +4327,7 @@ int __devinit mxc_epdc_fb_probe(struct platform_device *pdev)
 		var_info->blue.length = 5;
 		break;
 
-	case 8:
+	case 8:GALLEN_DBGLOCAL_RUNLOG(23);
 		/*
 		 * For 8-bit grayscale, R, G, and B offset are equal.
 		 *
@@ -3641,7 +4345,7 @@ int __devinit mxc_epdc_fb_probe(struct platform_device *pdev)
 		var_info->blue.msb_right = 0;
 		break;
 
-	default:
+	default:GALLEN_DBGLOCAL_RUNLOG(24);
 		dev_err(&pdev->dev, "unsupported bitwidth %d\n",
 			fb_data->default_bpp);
 		ret = -EINVAL;
@@ -3674,6 +4378,7 @@ int __devinit mxc_epdc_fb_probe(struct platform_device *pdev)
 
 	fb_data->auto_mode = AUTO_UPDATE_MODE_REGION_MODE;
 	fb_data->upd_scheme = UPDATE_SCHEME_QUEUE_AND_MERGE;
+	//fb_data->upd_scheme = UPDATE_SCHEME_SNAPSHOT;
 
 	/* Initialize our internal copy of the screeninfo */
 	fb_data->epdc_fb_var = *var_info;
@@ -3694,6 +4399,7 @@ int __devinit mxc_epdc_fb_probe(struct platform_device *pdev)
 	for (i = 0; i < EPDC_MAX_NUM_UPDATES; i++) {
 		upd_list = kzalloc(sizeof(*upd_list), GFP_KERNEL);
 		if (upd_list == NULL) {
+			GALLEN_DBGLOCAL_RUNLOG(25);
 			ret = -ENOMEM;
 			goto out_upd_buffers;
 		}
@@ -3709,6 +4415,7 @@ int __devinit mxc_epdc_fb_probe(struct platform_device *pdev)
 		    dma_alloc_coherent(fb_data->info.device, upd_list->size,
 				       &upd_list->phys_addr, GFP_DMA);
 		if (upd_list->virt_addr == NULL) {
+			GALLEN_DBGLOCAL_RUNLOG(26);
 			kfree(upd_list);
 			ret = -ENOMEM;
 			goto out_upd_buffers;
@@ -3719,6 +4426,8 @@ int __devinit mxc_epdc_fb_probe(struct platform_device *pdev)
 
 		dev_dbg(fb_data->info.device, "allocated %d bytes @ 0x%08X\n",
 			upd_list->size, upd_list->phys_addr);
+		DBG_MSG("[%s]Pxp out buffer allocated %d bytes @ 0x%08X\n",__FUNCTION__,
+			upd_list->size, upd_list->phys_addr);
 
 		/* Allocate memory for PxP SW workaround buffers */
 		/* These buffers are used to hold copy of the update region */
@@ -3726,9 +4435,12 @@ int __devinit mxc_epdc_fb_probe(struct platform_device *pdev)
 		    dma_alloc_coherent(fb_data->info.device, upd_list->size*2,
 				       &upd_list->phys_addr_copybuf, GFP_DMA);
 		if (upd_list->virt_addr_copybuf == NULL) {
+			GALLEN_DBGLOCAL_RUNLOG(27);
 			ret = -ENOMEM;
 			goto out_upd_buffers;
 		}
+		DBG_MSG("[%s]Pxp SW workarround allocated %d bytes @ 0x%08X\n",__FUNCTION__,
+			upd_list->size * 2, upd_list->phys_addr);
 	}
 
 	fb_data->working_buffer_size = vmode->yres * vmode->xres * 2;
@@ -3737,17 +4449,22 @@ int __devinit mxc_epdc_fb_probe(struct platform_device *pdev)
 	    dma_alloc_coherent(&pdev->dev, fb_data->working_buffer_size,
 			       &fb_data->working_buffer_phys, GFP_DMA);
 	if (fb_data->working_buffer_virt == NULL) {
+		GALLEN_DBGLOCAL_RUNLOG(28);
 		dev_err(&pdev->dev, "Can't allocate mem for working buf!\n");
 		ret = -ENOMEM;
 		goto out_upd_buffers;
 	}
-
+	DBG_MSG("[%s]:working buffer size=%d\n",__FUNCTION__,fb_data->working_buffer_size);
+	
 	/* Initialize EPDC pins */
-	if (fb_data->pdata->get_pins)
+	if (fb_data->pdata->get_pins) {
+		GALLEN_DBGLOCAL_RUNLOG(29);
 		fb_data->pdata->get_pins();
+	}
 
 	fb_data->epdc_clk_axi = clk_get(fb_data->dev, "epdc_axi");
 	if (IS_ERR(fb_data->epdc_clk_axi)) {
+		GALLEN_DBGLOCAL_RUNLOG(30);
 		dev_err(&pdev->dev, "Unable to get EPDC AXI clk."
 			"err = 0x%x\n", (int)fb_data->epdc_clk_axi);
 		ret = -ENODEV;
@@ -3755,6 +4472,7 @@ int __devinit mxc_epdc_fb_probe(struct platform_device *pdev)
 	}
 	fb_data->epdc_clk_pix = clk_get(fb_data->dev, "epdc_pix");
 	if (IS_ERR(fb_data->epdc_clk_pix)) {
+		GALLEN_DBGLOCAL_RUNLOG(31);
 		dev_err(&pdev->dev, "Unable to get EPDC pix clk."
 			"err = 0x%x\n", (int)fb_data->epdc_clk_pix);
 		ret = -ENODEV;
@@ -3776,16 +4494,21 @@ int __devinit mxc_epdc_fb_probe(struct platform_device *pdev)
 	fb_data->wv_modes.mode_gc16 = 2;
 	fb_data->wv_modes.mode_gc32 = 2;
 
+	fb_data->merge_on_waveform_mismatch = 1;
+
 	/* Initialize marker list */
 	INIT_LIST_HEAD(&fb_data->full_marker_list);
 
 	/* Initialize all LUTs to inactive */
-	for (i = 0; i < EPDC_NUM_LUTS; i++)
+	for (i = 0; i < EPDC_NUM_LUTS; i++) {
+		GALLEN_DBGLOCAL_RUNLOG(32);
 		fb_data->lut_update_order[i] = 0;
+	}
 
 	/* Retrieve EPDC IRQ num */
 	res = platform_get_resource(pdev, IORESOURCE_IRQ, 0);
 	if (res == NULL) {
+		GALLEN_DBGLOCAL_RUNLOG(33);
 		dev_err(&pdev->dev, "cannot get IRQ resource\n");
 		ret = -ENODEV;
 		goto out_dma_work_buf;
@@ -3796,6 +4519,7 @@ int __devinit mxc_epdc_fb_probe(struct platform_device *pdev)
 	ret = request_irq(fb_data->epdc_irq, mxc_epdc_irq_handler, 0,
 			"fb_dma", fb_data);
 	if (ret) {
+		GALLEN_DBGLOCAL_RUNLOG(34);
 		dev_err(&pdev->dev, "request_irq (%d) failed with error %d\n",
 			fb_data->epdc_irq, ret);
 		ret = -ENODEV;
@@ -3805,15 +4529,20 @@ int __devinit mxc_epdc_fb_probe(struct platform_device *pdev)
 	INIT_DELAYED_WORK(&fb_data->epdc_done_work, epdc_done_work_func);
 	fb_data->epdc_submit_workqueue = create_rt_workqueue("submit");
 	INIT_WORK(&fb_data->epdc_submit_work, epdc_submit_work_func);
+	INIT_WORK(&fb_data->epdc_firmware_work, epdc_firmware_func);
 
 	info->fbdefio = &mxc_epdc_fb_defio;
 #ifdef CONFIG_FB_MXC_EINK_AUTO_UPDATE_MODE
+	GALLEN_DBGLOCAL_RUNLOG(45);
 	fb_deferred_io_init(info);
 #endif
 
+#ifdef USE_PMIC
 	/* get pmic regulators */
+	GALLEN_DBGLOCAL_RUNLOG(46);
 	fb_data->display_regulator = regulator_get(NULL, "DISPLAY");
 	if (IS_ERR(fb_data->display_regulator)) {
+		GALLEN_DBGLOCAL_RUNLOG(35);
 		dev_err(&pdev->dev, "Unable to get display PMIC regulator."
 			"err = 0x%x\n", (int)fb_data->display_regulator);
 		ret = -ENODEV;
@@ -3821,15 +4550,24 @@ int __devinit mxc_epdc_fb_probe(struct platform_device *pdev)
 	}
 	fb_data->vcom_regulator = regulator_get(NULL, "VCOM");
 	if (IS_ERR(fb_data->vcom_regulator)) {
+		GALLEN_DBGLOCAL_RUNLOG(36);
 		regulator_put(fb_data->display_regulator);
 		dev_err(&pdev->dev, "Unable to get VCOM regulator."
 			"err = 0x%x\n", (int)fb_data->vcom_regulator);
 		ret = -ENODEV;
 		goto out_irq;
 	}
-
-	if (device_create_file(info->dev, &fb_attrs[0]))
+#else
+	GALLEN_DBGLOCAL_RUNLOG(47);
+    mxc_iomux_v3_setup_pad(MX50_PAD_EIM_CRE__GPIO_1_27);
+    gpio_request(GPIO_PWRALL, "epd_power_on");
+    gpio_direction_output(GPIO_PWRALL, 1);
+#endif
+	
+	if (device_create_file(info->dev, &fb_attrs[0])) {
+		GALLEN_DBGLOCAL_RUNLOG(37);
 		dev_err(&pdev->dev, "Unable to create file from fb_attrs\n");
+	}
 
 	fb_data->cur_update = NULL;
 
@@ -3930,11 +4668,16 @@ int __devinit mxc_epdc_fb_probe(struct platform_device *pdev)
 	fb_data->power_state = POWER_STATE_OFF;
 	fb_data->powering_down = false;
 	fb_data->wait_for_powerdown = false;
+	fb_data->updates_active = false;
 	fb_data->pwrdown_delay = 0;
+
+	
+	fake_s1d13522_parse_epd_cmdline();
 
 	/* Register FB */
 	ret = register_framebuffer(info);
 	if (ret) {
+		GALLEN_DBGLOCAL_RUNLOG(38);
 		dev_err(&pdev->dev,
 			"register_framebuffer failed with error %d\n", ret);
 		goto out_dmaengine;
@@ -3943,13 +4686,17 @@ int __devinit mxc_epdc_fb_probe(struct platform_device *pdev)
 	g_fb_data = fb_data;
 
 #ifdef DEFAULT_PANEL_HW_INIT
+	GALLEN_DBGLOCAL_RUNLOG(48);
 	ret = mxc_epdc_fb_init_hw((struct fb_info *)fb_data);
 	if (ret) {
+		GALLEN_DBGLOCAL_RUNLOG(39);
 		dev_err(&pdev->dev, "Failed to initialize HW!\n");
 	}
 #endif
 
+#if 0
 #ifdef CONFIG_FRAMEBUFFER_CONSOLE
+	GALLEN_DBGLOCAL_RUNLOG(49);
 	/* If FB console included, update display to show logo */
 	update.update_region.left = 0;
 	update.update_region.width = info->var.xres;
@@ -3964,9 +4711,12 @@ int __devinit mxc_epdc_fb_probe(struct platform_device *pdev)
 	mxc_epdc_fb_send_update(&update, info);
 
 	ret = mxc_epdc_fb_wait_update_complete(update.update_marker, info);
-	if (ret < 0)
+	if (ret < 0) {
+		GALLEN_DBGLOCAL_RUNLOG(40);
 		dev_err(fb_data->dev,
 			"Wait for update complete failed.  Error = 0x%x", ret);
+	}
+#endif
 #endif
 
 	goto out;
@@ -3978,11 +4728,14 @@ out_irq:
 out_dma_work_buf:
 	dma_free_writecombine(&pdev->dev, fb_data->working_buffer_size,
 		fb_data->working_buffer_virt, fb_data->working_buffer_phys);
-	if (fb_data->pdata->put_pins)
+	if (fb_data->pdata->put_pins) {
+		GALLEN_DBGLOCAL_RUNLOG(41);
 		fb_data->pdata->put_pins();
+	}
 out_upd_buffers:
 	list_for_each_entry_safe(plist, temp_list, &fb_data->upd_buf_free_list,
 			list) {
+		GALLEN_DBGLOCAL_RUNLOG(42);
 		list_del(&plist->list);
 		dma_free_writecombine(&pdev->dev, plist->size,
 				      plist->virt_addr,
@@ -4003,6 +4756,7 @@ out_cmap:
 out_fbdata:
 	kfree(fb_data);
 out:
+	GALLEN_DBGLOCAL_END();
 	return ret;
 }
 
@@ -4010,14 +4764,19 @@ static int mxc_epdc_fb_remove(struct platform_device *pdev)
 {
 	struct update_data_list *plist, *temp_list;
 	struct mxc_epdc_fb_data *fb_data = platform_get_drvdata(pdev);
+	
+	GALLEN_DBGLOCAL_BEGIN();
 
 	mxc_epdc_fb_blank(FB_BLANK_POWERDOWN, &fb_data->info);
 
 	flush_workqueue(fb_data->epdc_submit_workqueue);
 	destroy_workqueue(fb_data->epdc_submit_workqueue);
 
+#ifdef USE_PMIC
+	GALLEN_DBGLOCAL_RUNLOG(0);
 	regulator_put(fb_data->display_regulator);
 	regulator_put(fb_data->vcom_regulator);
+#endif
 
 	unregister_framebuffer(&fb_data->info);
 	free_irq(fb_data->epdc_irq, fb_data);
@@ -4025,12 +4784,16 @@ static int mxc_epdc_fb_remove(struct platform_device *pdev)
 	dma_free_writecombine(&pdev->dev, fb_data->working_buffer_size,
 				fb_data->working_buffer_virt,
 				fb_data->working_buffer_phys);
-	if (fb_data->waveform_buffer_virt != NULL)
+	if (fb_data->waveform_buffer_virt != NULL) 
+	{
+		GALLEN_DBGLOCAL_RUNLOG(1);
 		dma_free_writecombine(&pdev->dev, fb_data->waveform_buffer_size,
 				fb_data->waveform_buffer_virt,
 				fb_data->waveform_buffer_phys);
+	}
 	list_for_each_entry_safe(plist, temp_list, &fb_data->upd_buf_free_list,
 			list) {
+		GALLEN_DBGLOCAL_RUNLOG(2);		
 		list_del(&plist->list);
 		dma_free_writecombine(&pdev->dev, plist->size,
 				      plist->virt_addr,
@@ -4041,18 +4804,23 @@ static int mxc_epdc_fb_remove(struct platform_device *pdev)
 		kfree(plist);
 	}
 #ifdef CONFIG_FB_MXC_EINK_AUTO_UPDATE_MODE
+	GALLEN_DBGLOCAL_RUNLOG(3);
 	fb_deferred_io_cleanup(&fb_data->info);
 #endif
 
 	dma_free_writecombine(&pdev->dev, fb_data->map_size, fb_data->info.screen_base,
 			      fb_data->phys_start);
 
-	if (fb_data->pdata->put_pins)
+	if (fb_data->pdata->put_pins) {
+		GALLEN_DBGLOCAL_RUNLOG(4);
 		fb_data->pdata->put_pins();
+	}
 
 	/* Release PxP-related resources */
-	if (fb_data->pxp_chan != NULL)
+	if (fb_data->pxp_chan != NULL) {
+		GALLEN_DBGLOCAL_RUNLOG(5);
 		dma_release_channel(&fb_data->pxp_chan->dma_chan);
+	}
 
 	dmaengine_put();
 
@@ -4063,28 +4831,56 @@ static int mxc_epdc_fb_remove(struct platform_device *pdev)
 	framebuffer_release(&fb_data->info);
 	platform_set_drvdata(pdev, NULL);
 
+	GALLEN_DBGLOCAL_END();
 	return 0;
 }
 
 #ifdef CONFIG_PM
+extern void lm75_suspend (void);
+extern void lm75_resume (void);
+
 static int mxc_epdc_fb_suspend(struct platform_device *pdev, pm_message_t state)
 {
 	struct mxc_epdc_fb_data *data = platform_get_drvdata(pdev);
 	int ret;
-
+	
+	GALLEN_DBGLOCAL_BEGIN();
+	
+	mxc_epdc_fb_wait_update_complete(g_mxc_upd_data.update_marker++,&g_fb_data->info);
+	
 	ret = mxc_epdc_fb_blank(FB_BLANK_POWERDOWN, &data->info);
 	if (ret)
 		goto out;
 
+	if(6==gptHWCFG->m_val.bDisplayCtrl) {
+		tps65185_suspend();
+	}
+	else {
+		lm75_suspend ();
+	}
+
 out:
+	GALLEN_DBGLOCAL_END();
 	return ret;
 }
 
 static int mxc_epdc_fb_resume(struct platform_device *pdev)
 {
 	struct mxc_epdc_fb_data *data = platform_get_drvdata(pdev);
+	GALLEN_DBGLOCAL_BEGIN();
+	
+	if(6==gptHWCFG->m_val.bDisplayCtrl) {
+		tps65185_resume();
+	}
+	else {
+		lm75_resume();
+	}
+
+	gdwLastUpdateJiffies = 0;
+
 
 	mxc_epdc_fb_blank(FB_BLANK_UNBLANK, &data->info);
+	GALLEN_DBGLOCAL_END();
 	return 0;
 }
 #else
@@ -4110,6 +4906,8 @@ static void pxp_dma_done(void *arg)
 	struct dma_chan *chan = tx_desc->txd.chan;
 	struct pxp_channel *pxp_chan = to_pxp_channel(chan);
 	struct mxc_epdc_fb_data *fb_data = pxp_chan->client;
+	
+	DBG_MSG("[%s]\n",__FUNCTION__);
 
 	/* This call will signal wait_for_completion_timeout() in send_buffer_to_pxp */
 	complete(&fb_data->pxp_tx_cmpl);
@@ -4162,11 +4960,14 @@ static int pxp_process_update(struct mxc_epdc_fb_data *fb_data,
 	struct pxp_proc_data *proc_data = &fb_data->pxp_conf.proc_data;
 	int i, ret;
 	int length;
+	
+	GALLEN_DBGLOCAL_BEGIN();
 
 	dev_dbg(fb_data->dev, "Starting PxP Send Buffer\n");
 
 	/* First, check to see that we have acquired a PxP Channel object */
 	if (fb_data->pxp_chan == NULL) {
+		GALLEN_DBGLOCAL_RUNLOG(0);
 		/*
 		 * PxP Channel has not yet been created and initialized,
 		 * so let's go ahead and try
@@ -4178,6 +4979,7 @@ static int pxp_process_update(struct mxc_epdc_fb_data *fb_data,
 			 * PxP until the PxP DMA driver has loaded, so we abort
 			 */
 			dev_err(fb_data->dev, "PxP chan init failed\n");
+			GALLEN_DBGLOCAL_ESC();
 			return -ENODEV;
 		}
 	}
@@ -4200,6 +5002,7 @@ static int pxp_process_update(struct mxc_epdc_fb_data *fb_data,
 	if (!txd) {
 		dev_err(fb_data->info.device,
 			"Error preparing a DMA transaction descriptor.\n");
+		GALLEN_DBGLOCAL_ESC();
 		return -EIO;
 	}
 
@@ -4230,7 +5033,10 @@ static int pxp_process_update(struct mxc_epdc_fb_data *fb_data,
 	/* PXP expects rotation in terms of degrees */
 	proc_data->rotate = fb_data->epdc_fb_var.rotate * 90;
 	if (proc_data->rotate > 270)
+	{
+		GALLEN_DBGLOCAL_RUNLOG(1);
 		proc_data->rotate = 0;
+	}
 
 	pxp_conf->out_param.width = update_region->width;
 	pxp_conf->out_param.height = update_region->height;
@@ -4238,12 +5044,15 @@ static int pxp_process_update(struct mxc_epdc_fb_data *fb_data,
 	desc = to_tx_desc(txd);
 	length = desc->len;
 	for (i = 0; i < length; i++) {
+		GALLEN_DBGLOCAL_RUNLOG(2);
 		if (i == 0) {/* S0 */
+			GALLEN_DBGLOCAL_RUNLOG(3);
 			memcpy(&desc->proc_data, proc_data, sizeof(struct pxp_proc_data));
 			pxp_conf->s0_param.paddr = sg_dma_address(&sg[0]);
 			memcpy(&desc->layer_param.s0_param, &pxp_conf->s0_param,
 				sizeof(struct pxp_layer_param));
 		} else if (i == 1) {
+			GALLEN_DBGLOCAL_RUNLOG(4);
 			pxp_conf->out_param.paddr = sg_dma_address(&sg[1]);
 			memcpy(&desc->layer_param.out_param, &pxp_conf->out_param,
 				sizeof(struct pxp_layer_param));
@@ -4254,11 +5063,14 @@ static int pxp_process_update(struct mxc_epdc_fb_data *fb_data,
 	}
 
 	/* Submitting our TX starts the PxP processing task */
+	GALLEN_DBGLOCAL_PRINTMSG("[%s]tx_submit ==>\n",__FUNCTION__);
 	cookie = txd->tx_submit(txd);
+	GALLEN_DBGLOCAL_PRINTMSG("[%s]tx_submit <==\n",__FUNCTION__);
 	dev_dbg(fb_data->info.device, "%d: Submit %p #%d\n", __LINE__, txd,
 		cookie);
 	if (cookie < 0) {
 		dev_err(fb_data->info.device, "Error sending FB through PxP\n");
+		GALLEN_DBGLOCAL_ESC();
 		return -EIO;
 	}
 
@@ -4266,7 +5078,7 @@ static int pxp_process_update(struct mxc_epdc_fb_data *fb_data,
 
 	/* trigger ePxP */
 	dma_async_issue_pending(dma_chan);
-
+	GALLEN_DBGLOCAL_END();
 	return 0;
 }
 
@@ -4284,6 +5096,24 @@ static int pxp_complete_update(struct mxc_epdc_fb_data *fb_data, u32 *hist_stat)
 			 ret < 0 ? "user interrupt" : "timeout");
 		dma_release_channel(&fb_data->pxp_chan->dma_chan);
 		fb_data->pxp_chan = NULL;
+		
+		{
+			u32 reg_val;
+			
+			dump_epdc_reg();
+			dump_pending_list(fb_data);
+			
+			#if 0 // gallen test .
+			/* EPDC_CTRL */
+			reg_val = __raw_readl(EPDC_CTRL);
+			reg_val |= 0x80000000;
+			__raw_writel(reg_val, EPDC_CTRL_SET);		
+			mdelay(1);
+			reg_val &= ~0x80000000;
+			__raw_writel(reg_val, EPDC_CTRL_SET);		
+			#endif
+		}
+		
 		return ret ? : -ETIMEDOUT;
 	}
 
@@ -4300,8 +5130,12 @@ static int __init mxc_epdc_fb_init(void)
 {
 	return platform_driver_register(&mxc_epdc_fb_driver);
 }
-late_initcall(mxc_epdc_fb_init);
 
+#ifndef FW_IN_RAM
+late_initcall(mxc_epdc_fb_init);
+#else
+module_init(mxc_epdc_fb_init);
+#endif
 
 static void __exit mxc_epdc_fb_exit(void)
 {
